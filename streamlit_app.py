@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import altair as alt
 
 st.set_page_config(page_title="Daily Spend Tracker", layout="wide")
-st.title("💳 Daily Spending (Google Sheets)")
+st.title("💳 Daily Spending")
 
 # ------------------ Module Imports ------------------
 try:
