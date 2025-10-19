@@ -65,6 +65,7 @@ def _get_creds_info():
         return None
     return None
 
+
 def _read_sheet_with_index(spreadsheet_id: str, range_name: str, source_name: str, creds_info):
     if io_mod is None:
         return pd.DataFrame()
@@ -80,12 +81,14 @@ def _read_sheet_with_index(spreadsheet_id: str, range_name: str, source_name: st
     df['_source_sheet'] = source_name
     return df
 
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_sheets(spreadsheet_id, range_hist, range_append, creds_info, reload_key):
     """Cached sheet fetch (reloads when reload_key changes)."""
     hist_df = _read_sheet_with_index(spreadsheet_id, range_hist, "history", creds_info)
     app_df = _read_sheet_with_index(spreadsheet_id, range_append, "append", creds_info)
     return hist_df, app_df
+
 
 # ------------------ Read Google Sheets ------------------
 if io_mod is None:
@@ -114,10 +117,7 @@ if '_sheet_row_idx' not in sheet_full_df.columns:
 
 # ------------------ Handle soft-deleted rows ------------------
 if 'is_deleted' in sheet_full_df.columns:
-    try:
-        deleted_mask = sheet_full_df['is_deleted'].astype(str).str.lower().isin(['true', 't', '1', 'yes'])
-    except Exception:
-        deleted_mask = sheet_full_df['is_deleted'].astype(str).str.lower().isin(['true', 't', '1', 'yes'])
+    deleted_mask = sheet_full_df['is_deleted'].astype(str).str.lower().isin(['true', 't', '1', 'yes'])
     df_raw = sheet_full_df.loc[~deleted_mask].copy().reset_index(drop=True)
 else:
     df_raw = sheet_full_df.copy().reset_index(drop=True)
@@ -133,35 +133,11 @@ with st.spinner("Cleaning and deriving columns..."):
 def add_bank_column(df: pd.DataFrame, overwrite: bool = False) -> pd.DataFrame:
     df = df.copy()
     if 'Bank' in df.columns and not overwrite:
-        df['Bank'] = df['Bank'].astype(str).where(df['Bank'].notna(), None)
-        df['Bank'] = df['Bank'].fillna('Unknown')
+        df['Bank'] = df['Bank'].astype(str).fillna('Unknown')
         return df
-
-    cand_cols = ['bank', 'account', 'account_name', 'description', 'message', 'narration', 'merchant', 'beneficiary', 'note']
-    def _row_text(row):
-        parts = []
-        for c in cand_cols:
-            if c in row.index and pd.notna(row[c]):
-                parts.append(str(row[c]))
-        return " ".join(parts).lower()
-
+    cand_cols = ['bank', 'account', 'description', 'message', 'narration', 'merchant']
     bank_map = {'hdfc': 'HDFC Bank', 'indian bank': 'Indian Bank'}
-
-    try:
-        combined = df.apply(_row_text, axis=1)
-    except Exception:
-        combined = pd.Series([''] * len(df), index=df.index)
-
-    detected = []
-    for text in combined:
-        found = None
-        for patt, name in bank_map.items():
-            if patt in text:
-                found = name
-                break
-        detected.append(found if found else None)
-
-    df['Bank'] = pd.Series(detected).fillna('Unknown')
+    df['Bank'] = df[cand_cols].astype(str).agg(' '.join, axis=1).str.lower().map(lambda x: next((v for k, v in bank_map.items() if k in x), 'Unknown'))
     return df
 
 converted_df = add_bank_column(converted_df)
@@ -171,10 +147,7 @@ st.sidebar.header("Filters")
 banks_detected = sorted([b for b in converted_df['Bank'].unique() if pd.notna(b)])
 sel_banks = st.sidebar.multiselect("Banks", options=banks_detected, default=banks_detected)
 
-converted_df_filtered = (
-    converted_df[converted_df['Bank'].isin(sel_banks)].copy()
-    if sel_banks else converted_df.copy()
-)
+converted_df_filtered = converted_df[converted_df['Bank'].isin(sel_banks)] if sel_banks else converted_df
 
 # ------------------ Aggregation ------------------
 with st.spinner("Computing daily totals..."):
@@ -182,7 +155,7 @@ with st.spinner("Computing daily totals..."):
 
 month_map = {i: pd.Timestamp(1900, i, 1).strftime('%B') for i in range(1, 13)}
 
-# ------------------ Year/Month Filters ------------------
+# ------------------ Date Filters ------------------
 if not merged.empty:
     merged['Date'] = pd.to_datetime(merged['Date']).dt.normalize()
     years = sorted(merged['Date'].dt.year.unique().tolist())
@@ -196,19 +169,10 @@ else:
 
 # ------------------ Date Range ------------------
 tmp = converted_df_filtered.copy()
-if 'timestamp' in tmp.columns:
-    tmp['timestamp'] = pd.to_datetime(tmp['timestamp'], errors='coerce')
-elif 'date' in tmp.columns:
-    tmp['timestamp'] = pd.to_datetime(tmp['date'], errors='coerce')
-else:
-    tmp['timestamp'] = pd.NaT
-
+tmp['timestamp'] = pd.to_datetime(tmp.get('timestamp', tmp.get('date')), errors='coerce')
 valid_dates = tmp['timestamp'].dropna()
-if valid_dates.empty:
-    st.error("No valid dates found in data.")
-    st.stop()
-
 min_date, max_date = valid_dates.min().date(), valid_dates.max().date()
+
 totals_mode = st.sidebar.radio("Totals mode", ["Single date", "Date range"], index=0)
 today = datetime.utcnow().date()
 default_date = max(min_date, min(today, max_date))
@@ -222,7 +186,7 @@ else:
 
 start_sel, end_sel = [d.date() if isinstance(d, datetime) else d for d in selected_range]
 
-# ------------------ Totals Section ------------------
+# ------------------ Totals ------------------
 try:
     tmp_rows = converted_df_filtered.copy()
     tmp_rows['timestamp'] = pd.to_datetime(tmp_rows.get('timestamp', tmp_rows.get('date')), errors='coerce')
@@ -232,7 +196,8 @@ try:
     amt_col = next((c for c in sel_df.columns if c.lower() == 'amount'), None)
     type_col = next((c for c in sel_df.columns if c.lower() == 'type'), None)
 
-    credit_sum = debit_sum = credit_count = debit_count = 0.0
+    credit_sum = debit_sum = 0.0
+    credit_count = debit_count = 0
     if not sel_df.empty and amt_col:
         sel_df['amt'] = pd.to_numeric(sel_df[amt_col], errors='coerce').fillna(0.0)
         if type_col:
@@ -250,13 +215,35 @@ try:
 except Exception as e:
     st.error(f"Failed totals: {e}")
 
-# ------------------ (Rest of your chart, rows, delete, add-new-row sections stay the same) ------------------
-# Add this inside your success blocks:
+# ------------------ Chart ------------------
+st.subheader("Daily Spend and Credit")
+plot_df = merged.copy()
+if sel_year != 'All':
+    plot_df = plot_df[plot_df['Date'].dt.year == int(sel_year)]
+if sel_months:
+    inv_map = {v: k for k, v in month_map.items()}
+    selected_month_nums = [inv_map[m] for m in sel_months if m in inv_map]
+    plot_df = plot_df[plot_df['Date'].dt.month.isin(selected_month_nums)]
 
-# Soft delete success:
-# st.session_state.reload_key += 1
-# st.experimental_rerun()
+plot_df = plot_df.sort_values('Date')
+if not plot_df.empty:
+    show_debit = st.sidebar.checkbox("Show Debit (Total_Spent)", True)
+    show_credit = st.sidebar.checkbox("Show Credit (Total_Credit)", True)
+    series = [c for c in ['Total_Spent', 'Total_Credit'] if c in plot_df.columns]
+    if show_debit and 'Total_Spent' not in series: series.append('Total_Spent')
+    if show_credit and 'Total_Credit' not in series: series.append('Total_Credit')
+    if charts_mod:
+        try:
+            charts_mod.render_chart(plot_df, converted_df_filtered, "Daily line", series, 5)
+        except Exception:
+            st.line_chart(plot_df.set_index('Date')[series])
+    else:
+        st.line_chart(plot_df.set_index('Date')[series])
+else:
+    st.info("No data to plot for selected filters.")
 
-# Add new row success:
+# ------------------ Rows table, Soft-delete, Add new row ------------------
+# (identical logic as your previous working app)
+# Add this in the success blocks:
 # st.session_state.reload_key += 1
 # st.experimental_rerun()
