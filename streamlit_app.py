@@ -311,7 +311,7 @@ if io_mod is not None:
         st.session_state.reload_key += 1
         st.experimental_rerun()
 
-# ------------------ Add New Row ------------------
+# ------------------ Add New Row (fixed: provide multiple date/timestamp keys) ------------------
 if io_mod is not None:
     st.markdown("---")
     st.write("➕ Add a new transaction")
@@ -324,15 +324,28 @@ if io_mod is not None:
         submit_add = st.button("Save new row")
         if submit_add:
             dt_combined = datetime.combine(new_date, datetime.utcnow().time())
+            # Provide multiple common column name variants for date/timestamp so the
+            # append helper will find a matching header (DateTime, timestamp, date, Date)
+            timestamp_str = dt_combined.strftime("%Y-%m-%d %H:%M:%S")
+            date_str = dt_combined.date().isoformat()
+
             new_row = {
-                "timestamp": dt_combined.strftime("%Y-%m-%d %H:%M:%S"),
-                "date": dt_combined.date(),
+                # common timestamp column variants (sheet may use DateTime or timestamp)
+                "DateTime": timestamp_str,
+                "timestamp": timestamp_str,
+                # common date-only column variants (sheet may use date or Date)
+                "date": date_str,
+                "Date": date_str,
+
+                # other fields
                 "Bank": bank,
                 "Type": txn_type,
                 "Amount": amount,
                 "Message": msg,
+                # ensure explicit is_deleted flag
                 "is_deleted": "false",
             }
+
             res = io_mod.append_new_row(SHEET_ID, APPEND_RANGE, new_row, creds_info=creds_info, history_range=RANGE)
             if res.get("status") == "ok":
                 st.success("✅ Row added successfully!")
