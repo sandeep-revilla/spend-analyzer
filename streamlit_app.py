@@ -91,25 +91,40 @@ if history_df.empty and append_df.empty:
 # Combine sheets
 sheet_full_df = pd.concat([history_df, append_df], ignore_index=True, sort=False)
 
+# ---------------- Safe UID creation helper ----------------
+def _safe_col_as_str_series(df: pd.DataFrame, colname: str) -> pd.Series:
+    """
+    Return a pd.Series of strings for df[colname] if present; otherwise
+    return a Series of empty strings of the same length as df.
+    This avoids errors when using .astype on a fallback scalar.
+    """
+    if colname in df:
+        # Convert values to string safely
+        return df[colname].astype(object).fillna("").astype(str)
+    # Return an empty-string series with the same length
+    return pd.Series([""] * len(df), index=df.index, dtype=str)
+
 # ---------- Soft-delete normalization + dedupe logic ----------
-# Normalize is_deleted to a boolean mask (works with TRUE/FALSE or various truthy forms)
+# Normalize is_deleted to boolean mask
 if 'is_deleted' in sheet_full_df.columns:
     sheet_full_df['is_deleted_bool'] = sheet_full_df['is_deleted'].astype(str).str.lower().isin(['true','t','1','yes'])
 else:
     sheet_full_df['is_deleted_bool'] = False
 
 # Build deterministic _uid for a logical record so duplicates across sheets can be detected.
-# Use timestamp/date + Bank + Type + Amount + Message. Adjust fields if your sheet naming differs.
-def _coerce_str(x):
-    return "" if x is None else str(x)
-
-sheet_full_df['_uid'] = (
-    sheet_full_df.get('timestamp', sheet_full_df.get('date', '')).astype(str).fillna('') + '|' +
-    sheet_full_df.get('Bank', '').fillna('').astype(str) + '|' +
-    sheet_full_df.get('Type', '').fillna('').astype(str) + '|' +
-    sheet_full_df.get('Amount', '').fillna('').astype(str) + '|' +
-    sheet_full_df.get('Message', '').fillna('').astype(str)
+# Use timestamp/date + Bank + Type + Amount + Message (adjust field names if your sheet differs)
+part_ts = _safe_col_as_str_series(sheet_full_df, 'timestamp')
+part_date = _safe_col_as_str_series(sheet_full_df, 'date')
+# prefer timestamp over date when both exist
+time_series = part_ts.where(part_ts != "", part_date)
+uid = (
+    time_series.fillna("").astype(str).str.strip() + '|' +
+    _safe_col_as_str_series(sheet_full_df, 'Bank').str.strip() + '|' +
+    _safe_col_as_str_series(sheet_full_df, 'Type').str.strip() + '|' +
+    _safe_col_as_str_series(sheet_full_df, 'Amount').str.strip() + '|' +
+    _safe_col_as_str_series(sheet_full_df, 'Message').str.strip()
 )
+sheet_full_df['_uid'] = uid
 
 # If ANY copy of a uid is marked deleted, remove all copies of that uid (prevents resurrection)
 deleted_uids = sheet_full_df.loc[sheet_full_df['is_deleted_bool'], '_uid'].unique()
@@ -167,7 +182,7 @@ if not merged.empty:
 else:
     sel_year, sel_months = "All", []
 
-# ------------------ Date Range ------------------
+# ------------------ Date Range ------------------ 
 tmp = filtered_df.copy()
 tmp["timestamp"] = pd.to_datetime(tmp.get("timestamp", tmp.get("date")), errors="coerce")
 valid_dates = tmp["timestamp"].dropna()
@@ -232,8 +247,6 @@ if not plot_df.empty:
     if show_debit: cols.append("Total_Spent")
     if show_credit: cols.append("Total_Credit")
 
-    # Melt to long format for altair
-    # Ensure the columns exist; if not, fill with zeros
     for col in ["Total_Spent", "Total_Credit"]:
         if col not in plot_df.columns:
             plot_df[col] = 0.0
@@ -243,7 +256,6 @@ if not plot_df.empty:
                                                                   value_name="Amount")
     long["Type"] = long["Type"].map({"Total_Spent": "Debit", "Total_Credit": "Credit"})
     if cols:
-        # filter to selected series
         desired_map = {"Total_Spent": "Debit", "Total_Credit": "Credit"}
         selected_types = [desired_map[c] for c in cols]
         long = long[long["Type"].isin(selected_types)]
