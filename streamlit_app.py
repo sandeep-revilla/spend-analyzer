@@ -1,4 +1,5 @@
-# streamlit_app.py - Google Sheets only, hard-coded sheet config (with soft-delete + month filtering)
+# streamlit_app.py
+# Google Sheets only (secrets-based), with totals, month filtering, soft-delete, and append row.
 import streamlit as st
 import pandas as pd
 import importlib
@@ -8,7 +9,6 @@ st.set_page_config(page_title="Daily Spend", layout="wide")
 st.title("💳 Daily Spending (Google Sheets)")
 
 # ------------------ Modules ------------------
-# transform.py must exist and provide convert_columns_and_derives + compute_daily_totals
 try:
     transform = importlib.import_module("transform")
 except Exception as e:
@@ -16,37 +16,47 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-# io_helpers required for Google Sheets I/O
+# io_helpers (must implement read_google_sheet, parse_service_account_secret, append_new_row, mark_rows_deleted)
 try:
     import io_helpers as io_mod
 except Exception:
     io_mod = None
 
-# charts module (optional)
+# charts (optional)
 try:
     charts_mod = importlib.import_module("charts")
 except Exception:
     charts_mod = None
 
-# ------------------ Hard-coded Google Sheet configuration ------------------
-SHEET_ID = "1KZq_GLXdMBfQUhtp-NA8Jg-flxOppw7kFuIN6y_nOXk"
-RANGE = "Mock_data"                   # history sheet name/range (read)
-APPEND_RANGE = "Mock_manual_addition" # append sheet (for manual additions)
+# ------------------ Config (from Streamlit secrets) ------------------
+# Required keys in secrets:
+# SHEET_ID, RANGE, APPEND_RANGE, and gcp_service_account (object or string parsed by io_helpers.parse_service_account_secret)
+if not hasattr(st, "secrets") or not st.secrets:
+    st.error("Streamlit secrets are not configured. Add SHEET_ID, RANGE, APPEND_RANGE and gcp_service_account to Streamlit secrets.")
+    st.stop()
+
+SHEET_ID = st.secrets.get("SHEET_ID")
+RANGE = st.secrets.get("RANGE")
+APPEND_RANGE = st.secrets.get("APPEND_RANGE")
+
+if not SHEET_ID or not RANGE or not APPEND_RANGE:
+    st.error("Missing required secrets: SHEET_ID, RANGE, or APPEND_RANGE. Please add them to Streamlit secrets.")
+    st.stop()
 
 # ------------------ Helpers ------------------
 def _get_creds_info():
-    """Return plain creds dict or None (safe to pass into io_helpers functions)."""
+    """Return parsed service account credentials or None."""
     if io_mod is None:
         return None
     try:
-        if hasattr(st, "secrets") and st.secrets and "gcp_service_account" in st.secrets:
+        if "gcp_service_account" in st.secrets:
             return io_mod.parse_service_account_secret(st.secrets["gcp_service_account"])
     except Exception:
         return None
     return None
 
 def _read_sheet_with_index(spreadsheet_id: str, range_name: str, source_name: str, creds_info):
-    """Read a sheet and return DataFrame with _sheet_row_idx and _source_sheet columns."""
+    """Read sheet and add _sheet_row_idx and _source_sheet columns. Returns empty DataFrame on failure."""
     if io_mod is None:
         return pd.DataFrame()
     try:
@@ -61,7 +71,7 @@ def _read_sheet_with_index(spreadsheet_id: str, range_name: str, source_name: st
     df['_source_sheet'] = source_name
     return df
 
-# ------------------ Read data from Google Sheets (hard-coded) ------------------
+# ------------------ Read sheets ------------------
 if io_mod is None:
     st.error("io_helpers.py is required for Google Sheets interaction. Add io_helpers.py to the project.")
     st.stop()
@@ -75,21 +85,19 @@ with st.spinner("Fetching Google Sheets..."):
     history_df = _read_sheet_with_index(SHEET_ID, RANGE, "history", creds_info)
     append_df = _read_sheet_with_index(SHEET_ID, APPEND_RANGE, "append", creds_info)
 
-# combine
-if history_df is None:
-    history_df = pd.DataFrame()
-if append_df is None:
-    append_df = pd.DataFrame()
+# normalize None -> empty DataFrame
+history_df = history_df if history_df is not None else pd.DataFrame()
+append_df = append_df if append_df is not None else pd.DataFrame()
 
 if history_df.empty and append_df.empty:
-    st.error("No rows found in the configured Google Sheets. Check the sheet names and permissions.")
+    st.error("No rows found in configured Google Sheets. Verify sheet names and service account permissions.")
     st.stop()
 
 sheet_full_df = pd.concat([history_df, append_df], ignore_index=True, sort=False)
 if '_sheet_row_idx' not in sheet_full_df.columns:
     sheet_full_df['_sheet_row_idx'] = pd.NA
 
-# filter soft-deleted rows if applicable
+# remove soft-deleted rows (if 'is_deleted' column exists)
 if 'is_deleted' in sheet_full_df.columns:
     try:
         deleted_mask = sheet_full_df['is_deleted'].astype(str).str.lower().isin(['true', 't', '1', 'yes'])
@@ -103,7 +111,7 @@ if df_raw is None or df_raw.empty:
     st.error("No visible data after filtering deleted rows.")
     st.stop()
 
-# ------------------ Transform and bank detection ------------------
+# ------------------ Transform + bank detection ------------------
 with st.spinner("Cleaning and deriving columns..."):
     converted_df = transform.convert_columns_and_derives(df_raw)
 
@@ -126,6 +134,7 @@ def add_bank_column(df: pd.DataFrame, overwrite: bool = False) -> pd.DataFrame:
         'hdfc': 'HDFC Bank',
         'indian bank': 'Indian Bank',
     }
+
     try:
         combined = df.apply(_row_text, axis=1)
     except Exception:
@@ -146,7 +155,7 @@ def add_bank_column(df: pd.DataFrame, overwrite: bool = False) -> pd.DataFrame:
 
 converted_df = add_bank_column(converted_df, overwrite=False)
 
-# ------------------ Filters (non-sensitive UI only) ------------------
+# ------------------ Sidebar Filters (non-sensitive) ------------------
 st.sidebar.header("Filters")
 # Bank filter
 banks_detected = sorted([b for b in converted_df['Bank'].unique() if pd.notna(b)])
@@ -157,11 +166,11 @@ if sel_banks:
 else:
     converted_df_filtered = converted_df.copy()
 
-# ------------------ Compute daily totals ------------------
+# ------------------ Compute daily totals (aggregation) ------------------
 with st.spinner("Computing daily totals..."):
     merged = transform.compute_daily_totals(converted_df_filtered)
 
-# ------------------ Year / Month filters (new) ------------------
+# ------------------ Year / Month filters ------------------
 if not merged.empty:
     merged['Date'] = pd.to_datetime(merged['Date']).dt.normalize()
     years = sorted(merged['Date'].dt.year.unique().tolist())
@@ -180,8 +189,7 @@ else:
     sel_year = 'All'
     sel_months = []
 
-# ------------------ Date range selection (safe clamp) ------------------
-# compute min/max from filtered converted_df
+# ------------------ Determine date range (min/max) from filtered transaction rows ------------------
 try:
     tmp = converted_df_filtered.copy()
     if 'timestamp' in tmp.columns:
@@ -201,6 +209,7 @@ except Exception as e:
     st.error(f"Failed to determine date range from data: {e}")
     st.stop()
 
+# ------------------ Date selection (single or range) ------------------
 totals_mode = st.sidebar.radio("Totals mode", ["Single date", "Date range"], index=0)
 today = datetime.utcnow().date()
 default_date = max(min_date, min(today, max_date))
@@ -216,12 +225,71 @@ else:
     else:
         selected_date_range_for_totals = (dr, dr)
 
+# ------------------ Totals for selected date / range (Credits / Debits / Net) ------------------
+try:
+    start_sel, end_sel = selected_date_range_for_totals
+    # normalize datetimes to dates
+    if isinstance(start_sel, datetime):
+        start_sel = start_sel.date()
+    if isinstance(end_sel, datetime):
+        end_sel = end_sel.date()
+
+    tmp_rows = converted_df_filtered.copy()
+    if 'timestamp' in tmp_rows.columns:
+        tmp_rows['timestamp'] = pd.to_datetime(tmp_rows['timestamp'], errors='coerce')
+    elif 'date' in tmp_rows.columns:
+        tmp_rows['timestamp'] = pd.to_datetime(tmp_rows['date'], errors='coerce')
+    else:
+        tmp_rows['timestamp'] = pd.NaT
+
+    mask_sel = tmp_rows['timestamp'].dt.date.between(start_sel, end_sel)
+    sel_df = tmp_rows.loc[mask_sel].copy()
+
+    col_map_lower = {c.lower(): c for c in sel_df.columns}
+    amount_col = col_map_lower.get('amount')
+    type_col = col_map_lower.get('type')
+
+    credit_sum = 0.0
+    debit_sum = 0.0
+    credit_count = 0
+    debit_count = 0
+
+    if not sel_df.empty and amount_col is not None:
+        if type_col is not None:
+            sel_df['type_norm'] = sel_df[type_col].astype(str).str.lower().str.strip()
+            credit_mask = sel_df['type_norm'] == 'credit'
+            debit_mask = sel_df['type_norm'] == 'debit'
+            credit_sum = pd.to_numeric(sel_df.loc[credit_mask, amount_col], errors='coerce').fillna(0.0).sum()
+            debit_sum = pd.to_numeric(sel_df.loc[debit_mask, amount_col], errors='coerce').fillna(0.0).sum()
+            credit_count = int(credit_mask.sum())
+            debit_count = int(debit_mask.sum())
+        else:
+            # fallback heuristic
+            text_cols = [c for c in sel_df.columns if sel_df[c].dtype == object]
+            for _, r in sel_df.iterrows():
+                amt = pd.to_numeric(r.get(amount_col, 0), errors='coerce')
+                if pd.isna(amt):
+                    amt = 0.0
+                txt = " ".join(str(r[c]) for c in text_cols if pd.notna(r[c])).lower()
+                if 'credit' in txt:
+                    credit_sum += amt
+                    credit_count += 1
+                else:
+                    debit_sum += amt
+                    debit_count += 1
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric(f"Credits ({start_sel} → {end_sel})", f"₹{credit_sum:,.0f}", f"{credit_count} txns")
+    col2.metric(f"Debits ({start_sel} → {end_sel})", f"₹{debit_sum:,.0f}", f"{debit_count} txns")
+    col3.metric("Net (Credits − Debits)", f"₹{(credit_sum - debit_sum):,.0f}")
+
+except Exception as e:
+    st.error(f"Failed to compute totals for selected date/range: {e}")
+
 # ------------------ Apply year/month and date filters to aggregated plot_df ------------------
 plot_df = merged.copy()
-# apply year filter
 if sel_year != 'All':
     plot_df = plot_df[plot_df['Date'].dt.year == int(sel_year)]
-# apply months filter if selected
 if sel_months:
     inv_map = {v: k for k, v in month_map.items()}
     selected_month_nums = [inv_map[m] for m in sel_months if m in inv_map]
@@ -290,7 +358,6 @@ else:
             display_df[c] = pd.to_datetime(display_df[c], errors='coerce').dt.strftime('%Y-%m-%d %H:%M:%S').fillna('')
         if lc == 'amount':
             display_df[c] = pd.to_numeric(display_df[c], errors='coerce')
-    # pretty rename
     pretty_rename = {}
     for c in display_df.columns:
         lc = c.lower()
@@ -318,20 +385,16 @@ else:
     # ------------------ Build selectable mapping (label -> (sheet_range, sheet_row_idx)) ------------------
     selectable = False
     selectable_labels = []
-    selectable_label_to_target = {}  # label -> (range_name, idx)
+    selectable_label_to_target = {}
 
-    # Build mapping for Google Sheets (use converted_df_filtered which preserved _sheet_row_idx/_source_sheet)
     map_df = converted_df_filtered.copy()
     if '_sheet_row_idx' in map_df.columns and '_source_sheet' in map_df.columns:
-        # ensure timestamp parsing for filtering
         try:
             map_df['timestamp'] = pd.to_datetime(map_df['timestamp'], errors='coerce')
         except Exception:
             pass
-        # Keep only rows in the displayed date window to avoid mismatches
         if start_sel and end_sel:
             map_df = map_df[(map_df['timestamp'].dt.date >= start_sel) & (map_df['timestamp'].dt.date <= end_sel)]
-        # Build labels and mapping
         for i, r in map_df.iterrows():
             ts = ''
             if 'timestamp' in r and pd.notna(r['timestamp']):
@@ -339,15 +402,12 @@ else:
                     ts = pd.to_datetime(r['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
                 except Exception:
                     ts = str(r['timestamp'])
-            # prefer Amount or amount-like columns
             amt = r.get('Amount', r.get('amount', ''))
             msg = r.get('Message', '') if 'Message' in r else (r.get('message', '') if 'message' in r else '')
             src = r.get('_source_sheet', 'history')
             idx = r.get('_sheet_row_idx')
             label = f"{i+1} | {src} | {ts} | {amt} | {str(msg)[:60]}"
-            # map to corresponding range name used for write (history->RANGE, append->APPEND_RANGE)
             tgt_range = APPEND_RANGE if src == 'append' else RANGE
-            # store mapping only if idx is not null
             try:
                 if pd.isna(idx):
                     continue
@@ -358,7 +418,7 @@ else:
         if selectable_labels:
             selectable = True
 
-    # ------------------ Soft-delete UI (bulk actions -> mark rows deleted in sheet) ------------------
+    # ------------------ Soft-delete UI ------------------
     if io_mod is not None and selectable:
         st.markdown("---")
         st.write("Bulk actions (Google Sheet only)")
@@ -372,7 +432,6 @@ else:
             if not selected_labels:
                 st.warning("No rows selected.")
             else:
-                # Group selected labels by target range
                 groups = {}
                 for lbl in selected_labels:
                     tgt = selectable_label_to_target.get(lbl)
@@ -396,7 +455,6 @@ else:
                         if isinstance(res, dict) and res.get('status') == 'ok':
                             total_updated += int(res.get('updated', 0))
                         else:
-                            # try to give helpful message
                             st.error(f"Failed to mark rows deleted in {rng}: {res}")
                             any_error = True
                     except Exception as e:
@@ -408,7 +466,6 @@ else:
                     st.experimental_rerun()
 
 # ------------------ Optional: Add new row (writes to append sheet) ------------------
-# Keep this optional write functionality but hide any sheet IDs / creds from UI.
 if io_mod is not None:
     st.markdown("---")
     st.write("Add a new transaction (will write to the append sheet)")
@@ -439,7 +496,14 @@ if io_mod is not None:
             }
             try:
                 creds_info = _get_creds_info()
-                res = io_mod.append_new_row(spreadsheet_id=SHEET_ID, range_name=APPEND_RANGE, new_row_dict=new_row, creds_info=creds_info, creds_file=None, history_range=RANGE)
+                res = io_mod.append_new_row(
+                    spreadsheet_id=SHEET_ID,
+                    range_name=APPEND_RANGE,
+                    new_row_dict=new_row,
+                    creds_info=creds_info,
+                    creds_file=None,
+                    history_range=RANGE
+                )
                 if isinstance(res, dict) and res.get('status') == 'ok':
                     st.success("Appended new row to append sheet.")
                     st.experimental_rerun()
