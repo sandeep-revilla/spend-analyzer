@@ -1,5 +1,4 @@
-# streamlit_app.py
-# Google Sheets only (secrets-based), with totals, month filtering, soft-delete, and append row.
+# streamlit_app.py - Google Sheets only (secrets-based), robust chart handling + totals + soft-delete
 import streamlit as st
 import pandas as pd
 import importlib
@@ -16,21 +15,17 @@ except Exception as e:
     st.exception(e)
     st.stop()
 
-# io_helpers (must implement read_google_sheet, parse_service_account_secret, append_new_row, mark_rows_deleted)
 try:
     import io_helpers as io_mod
 except Exception:
     io_mod = None
 
-# charts (optional)
 try:
     charts_mod = importlib.import_module("charts")
 except Exception:
     charts_mod = None
 
 # ------------------ Config (from Streamlit secrets) ------------------
-# Required keys in secrets:
-# SHEET_ID, RANGE, APPEND_RANGE, and gcp_service_account (object or string parsed by io_helpers.parse_service_account_secret)
 if not hasattr(st, "secrets") or not st.secrets:
     st.error("Streamlit secrets are not configured. Add SHEET_ID, RANGE, APPEND_RANGE and gcp_service_account to Streamlit secrets.")
     st.stop()
@@ -38,14 +33,12 @@ if not hasattr(st, "secrets") or not st.secrets:
 SHEET_ID = st.secrets.get("SHEET_ID")
 RANGE = st.secrets.get("RANGE")
 APPEND_RANGE = st.secrets.get("APPEND_RANGE")
-
 if not SHEET_ID or not RANGE or not APPEND_RANGE:
     st.error("Missing required secrets: SHEET_ID, RANGE, or APPEND_RANGE. Please add them to Streamlit secrets.")
     st.stop()
 
 # ------------------ Helpers ------------------
 def _get_creds_info():
-    """Return parsed service account credentials or None."""
     if io_mod is None:
         return None
     try:
@@ -56,7 +49,6 @@ def _get_creds_info():
     return None
 
 def _read_sheet_with_index(spreadsheet_id: str, range_name: str, source_name: str, creds_info):
-    """Read sheet and add _sheet_row_idx and _source_sheet columns. Returns empty DataFrame on failure."""
     if io_mod is None:
         return pd.DataFrame()
     try:
@@ -85,7 +77,6 @@ with st.spinner("Fetching Google Sheets..."):
     history_df = _read_sheet_with_index(SHEET_ID, RANGE, "history", creds_info)
     append_df = _read_sheet_with_index(SHEET_ID, APPEND_RANGE, "append", creds_info)
 
-# normalize None -> empty DataFrame
 history_df = history_df if history_df is not None else pd.DataFrame()
 append_df = append_df if append_df is not None else pd.DataFrame()
 
@@ -97,7 +88,7 @@ sheet_full_df = pd.concat([history_df, append_df], ignore_index=True, sort=False
 if '_sheet_row_idx' not in sheet_full_df.columns:
     sheet_full_df['_sheet_row_idx'] = pd.NA
 
-# remove soft-deleted rows (if 'is_deleted' column exists)
+# handle soft-deleted rows
 if 'is_deleted' in sheet_full_df.columns:
     try:
         deleted_mask = sheet_full_df['is_deleted'].astype(str).str.lower().isin(['true', 't', '1', 'yes'])
@@ -155,9 +146,8 @@ def add_bank_column(df: pd.DataFrame, overwrite: bool = False) -> pd.DataFrame:
 
 converted_df = add_bank_column(converted_df, overwrite=False)
 
-# ------------------ Sidebar Filters (non-sensitive) ------------------
+# ------------------ Sidebar Filters ------------------
 st.sidebar.header("Filters")
-# Bank filter
 banks_detected = sorted([b for b in converted_df['Bank'].unique() if pd.notna(b)])
 sel_banks = st.sidebar.multiselect("Banks", options=banks_detected, default=banks_detected)
 
@@ -166,9 +156,12 @@ if sel_banks:
 else:
     converted_df_filtered = converted_df.copy()
 
-# ------------------ Compute daily totals (aggregation) ------------------
+# ------------------ Aggregation ------------------
 with st.spinner("Computing daily totals..."):
     merged = transform.compute_daily_totals(converted_df_filtered)
+
+# ensure month_map exists even if merged is empty
+month_map = {i: pd.Timestamp(1900, i, 1).strftime('%B') for i in range(1, 13)}
 
 # ------------------ Year / Month filters ------------------
 if not merged.empty:
@@ -182,14 +175,13 @@ if not merged.empty:
     else:
         month_frame = merged[merged['Date'].dt.year == int(sel_year)]
     month_nums = sorted(month_frame['Date'].dt.month.unique().tolist())
-    month_map = {i: pd.Timestamp(1900, i, 1).strftime('%B') for i in range(1, 13)}
     month_choices = [month_map[m] for m in month_nums]
     sel_months = st.sidebar.multiselect("Month(s)", options=month_choices, default=month_choices)
 else:
     sel_year = 'All'
     sel_months = []
 
-# ------------------ Determine date range (min/max) from filtered transaction rows ------------------
+# ------------------ Determine date range ------------------
 try:
     tmp = converted_df_filtered.copy()
     if 'timestamp' in tmp.columns:
@@ -209,7 +201,7 @@ except Exception as e:
     st.error(f"Failed to determine date range from data: {e}")
     st.stop()
 
-# ------------------ Date selection (single or range) ------------------
+# ------------------ Date selection ------------------
 totals_mode = st.sidebar.radio("Totals mode", ["Single date", "Date range"], index=0)
 today = datetime.utcnow().date()
 default_date = max(min_date, min(today, max_date))
@@ -225,10 +217,9 @@ else:
     else:
         selected_date_range_for_totals = (dr, dr)
 
-# ------------------ Totals for selected date / range (Credits / Debits / Net) ------------------
+# ------------------ Totals for selected date / range ------------------
 try:
     start_sel, end_sel = selected_date_range_for_totals
-    # normalize datetimes to dates
     if isinstance(start_sel, datetime):
         start_sel = start_sel.date()
     if isinstance(end_sel, datetime):
@@ -264,7 +255,6 @@ try:
             credit_count = int(credit_mask.sum())
             debit_count = int(debit_mask.sum())
         else:
-            # fallback heuristic
             text_cols = [c for c in sel_df.columns if sel_df[c].dtype == object]
             for _, r in sel_df.iterrows():
                 amt = pd.to_numeric(r.get(amount_col, 0), errors='coerce')
@@ -300,38 +290,89 @@ plot_df = plot_df.sort_values('Date').reset_index(drop=True)
 plot_df['Total_Spent'] = pd.to_numeric(plot_df.get('Total_Spent', 0), errors='coerce').fillna(0.0).astype('float64')
 plot_df['Total_Credit'] = pd.to_numeric(plot_df.get('Total_Credit', 0), errors='coerce').fillna(0.0).astype('float64')
 
-# ------------------ Chart & rendering ------------------
+# ------------------ Chart & rendering (robust + fallback) ------------------
 st.subheader("Daily Spend and Credit")
 if plot_df.empty:
     st.info("No aggregated data available for selected filters.")
 else:
-    plot_df['Date'] = pd.to_datetime(plot_df['Date'])
+    # Ensure Date is proper datetime and drop missing Dates
+    try:
+        plot_df['Date'] = pd.to_datetime(plot_df['Date'], errors='coerce')
+    except Exception:
+        pass
+    plot_df = plot_df.dropna(subset=['Date']).copy()
+
+    # Choose series
     show_debit = st.sidebar.checkbox("Show Debit (Total_Spent)", value=True)
     show_credit = st.sidebar.checkbox("Show Credit (Total_Credit)", value=True)
     series_selected = []
-    if show_debit: series_selected.append('Total_Spent')
-    if show_credit: series_selected.append('Total_Credit')
+    if show_debit:
+        series_selected.append('Total_Spent')
+    if show_credit:
+        series_selected.append('Total_Credit')
 
-    if charts_mod is not None:
-        charts_mod.render_chart(plot_df=plot_df, converted_df=converted_df_filtered, chart_type="Daily line", series_selected=series_selected, top_n=5)
+    existing_series = [c for c in series_selected if c in plot_df.columns]
+    if not existing_series:
+        numeric_cols = plot_df.select_dtypes(include=['number']).columns.tolist()
+        fallback = [c for c in ['Total_Spent', 'Total_Credit'] if c in numeric_cols]
+        existing_series = fallback if fallback else numeric_cols[:2]
+
+    if not existing_series:
+        st.info("No numeric series available to plot.")
     else:
+        # coerce to numeric, drop rows where all series are NaN
+        for c in existing_series:
+            plot_df[c] = pd.to_numeric(plot_df.get(c, 0), errors='coerce')
+        plot_df = plot_df.dropna(subset=existing_series, how='all')
+        # build safe_df indexed by Date
         try:
-            st.line_chart(plot_df.set_index('Date')[series_selected] if series_selected else plot_df.set_index('Date')[["Total_Spent","Total_Credit"]])
+            safe_df = plot_df.set_index('Date')[existing_series].sort_index()
         except Exception:
-            st.line_chart(plot_df.set_index('Date')[["Total_Spent","Total_Credit"]])
+            plot_df['Date_str'] = plot_df['Date'].dt.strftime('%Y-%m-%d')
+            try:
+                safe_df = plot_df.set_index('Date_str')[existing_series].sort_index()
+            except Exception:
+                safe_df = None
+
+        # Try custom renderer; fallback to built-in line chart if it fails
+        if charts_mod is not None:
+            try:
+                # pass copies to avoid side-effects
+                charts_mod.render_chart(
+                    plot_df=plot_df.reset_index(drop=True).copy(),
+                    converted_df=converted_df_filtered.copy(),
+                    chart_type="Daily line",
+                    series_selected=existing_series,
+                    top_n=5
+                )
+            except Exception as e:
+                st.warning("Custom chart renderer failed — falling back to the built-in chart. " f"Error: {e}")
+                if safe_df is not None and not safe_df.empty:
+                    st.line_chart(safe_df)
+                else:
+                    try:
+                        st.line_chart(plot_df.set_index('Date')[existing_series])
+                    except Exception as e2:
+                        st.error(f"Failed to plot fallback chart: {e2}")
+        else:
+            if safe_df is not None and not safe_df.empty:
+                st.line_chart(safe_df)
+            else:
+                try:
+                    st.line_chart(plot_df.set_index('Date')[existing_series])
+                except Exception as e:
+                    st.error(f"Failed to plot chart: {e}")
 
 # ------------------ Rows view & download ------------------
 st.subheader("Rows (matching selection)")
 rows_df = converted_df_filtered.copy()
 if 'timestamp' in rows_df.columns:
     rows_df['timestamp'] = pd.to_datetime(rows_df['timestamp'], errors='coerce')
+elif 'date' in rows_df.columns:
+    rows_df['timestamp'] = pd.to_datetime(rows_df['date'], errors='coerce')
 else:
-    if 'date' in rows_df.columns:
-        rows_df['timestamp'] = pd.to_datetime(rows_df['date'], errors='coerce')
-    else:
-        rows_df['timestamp'] = pd.NaT
+    rows_df['timestamp'] = pd.NaT
 
-# apply date-range filter to rows (inclusive)
 start_sel, end_sel = selected_date_range_for_totals
 if isinstance(start_sel, datetime):
     start_sel = start_sel.date()
@@ -341,7 +382,6 @@ if isinstance(end_sel, datetime):
 if start_sel and end_sel:
     rows_df = rows_df[(rows_df['timestamp'].dt.date >= start_sel) & (rows_df['timestamp'].dt.date <= end_sel)]
 
-# display preferred columns if present
 _desired = ['timestamp', 'bank', 'type', 'amount', 'suspicious', 'message']
 col_map = {c.lower(): c for c in rows_df.columns}
 display_cols = [col_map[d] for d in _desired if d in col_map]
@@ -382,7 +422,7 @@ else:
     csv_bytes = display_df.to_csv(index=False).encode("utf-8")
     st.download_button("Download rows (CSV)", csv_bytes, file_name="transactions_rows.csv", mime="text/csv")
 
-    # ------------------ Build selectable mapping (label -> (sheet_range, sheet_row_idx)) ------------------
+    # Build selectable mapping
     selectable = False
     selectable_labels = []
     selectable_label_to_target = {}
@@ -418,7 +458,7 @@ else:
         if selectable_labels:
             selectable = True
 
-    # ------------------ Soft-delete UI ------------------
+    # Soft-delete UI
     if io_mod is not None and selectable:
         st.markdown("---")
         st.write("Bulk actions (Google Sheet only)")
