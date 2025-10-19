@@ -5,7 +5,7 @@ import importlib
 from datetime import datetime, timedelta
 
 st.set_page_config(page_title="Daily Spend", layout="wide")
-st.title("💳 Daily Spending (Google Sheets)")
+st.title("💳 Daily Spending")
 
 # ------------------ Modules ------------------
 try:
