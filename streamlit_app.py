@@ -3,6 +3,7 @@ import streamlit as st
 import pandas as pd
 import importlib
 from datetime import datetime, timedelta
+import altair as alt
 
 st.set_page_config(page_title="Daily Spend Tracker", layout="wide")
 st.title("💳 Daily Spending (Google Sheets)")
@@ -55,7 +56,7 @@ if st.session_state.last_refreshed:
 
 # ------------------ Google Auth Helpers ------------------
 def _get_creds_info():
-    if "gcp_service_account" in st.secrets:
+    if "gcp_service_account" in st.secrets and io_mod is not None:
         return io_mod.parse_service_account_secret(st.secrets["gcp_service_account"])
     return None
 
@@ -63,7 +64,7 @@ def _read_sheet_with_index(spreadsheet_id, range_name, source_name, creds_info):
     df = io_mod.read_google_sheet(spreadsheet_id, range_name, creds_info=creds_info, creds_file=None)
     df = df.reset_index(drop=True)
     if not df.empty:
-        df['_sheet_row_idx'] = df.index.astype(int)
+        df['_sheet_row_idx'] = df.index.astype(int)  # 0-based relative to sheet data rows
     df['_source_sheet'] = source_name
     return df
 
@@ -87,12 +88,41 @@ if history_df.empty and append_df.empty:
     st.error("No data found in the Google Sheets.")
     st.stop()
 
+# Combine sheets
 sheet_full_df = pd.concat([history_df, append_df], ignore_index=True, sort=False)
+
+# ---------- Soft-delete normalization + dedupe logic ----------
+# Normalize is_deleted to a boolean mask (works with TRUE/FALSE or various truthy forms)
 if 'is_deleted' in sheet_full_df.columns:
-    deleted_mask = sheet_full_df['is_deleted'].astype(str).str.lower().isin(['true', 't', '1', 'yes'])
-    df_raw = sheet_full_df.loc[~deleted_mask].copy()
+    sheet_full_df['is_deleted_bool'] = sheet_full_df['is_deleted'].astype(str).str.lower().isin(['true','t','1','yes'])
 else:
-    df_raw = sheet_full_df.copy()
+    sheet_full_df['is_deleted_bool'] = False
+
+# Build deterministic _uid for a logical record so duplicates across sheets can be detected.
+# Use timestamp/date + Bank + Type + Amount + Message. Adjust fields if your sheet naming differs.
+def _coerce_str(x):
+    return "" if x is None else str(x)
+
+sheet_full_df['_uid'] = (
+    sheet_full_df.get('timestamp', sheet_full_df.get('date', '')).astype(str).fillna('') + '|' +
+    sheet_full_df.get('Bank', '').fillna('').astype(str) + '|' +
+    sheet_full_df.get('Type', '').fillna('').astype(str) + '|' +
+    sheet_full_df.get('Amount', '').fillna('').astype(str) + '|' +
+    sheet_full_df.get('Message', '').fillna('').astype(str)
+)
+
+# If ANY copy of a uid is marked deleted, remove all copies of that uid (prevents resurrection)
+deleted_uids = sheet_full_df.loc[sheet_full_df['is_deleted_bool'], '_uid'].unique()
+if len(deleted_uids) > 0:
+    sheet_full_df = sheet_full_df.loc[~sheet_full_df['_uid'].isin(deleted_uids)].copy()
+
+# Deduplicate duplicates (prefer history over append)
+src_rank_map = {'history': 0, 'append': 1}
+sheet_full_df['_src_rank'] = sheet_full_df['_source_sheet'].map(src_rank_map).fillna(1)
+sheet_full_df = sheet_full_df.sort_values(['_uid', '_src_rank']).drop_duplicates('_uid', keep='first').reset_index(drop=True)
+
+# Build the visible dataframe (df_raw) — after deletion/dedupe
+df_raw = sheet_full_df.copy()
 
 if df_raw.empty:
     st.warning("No visible data after filtering deleted rows.")
@@ -195,13 +225,39 @@ if sel_months:
     plot_df = plot_df[plot_df["Date"].dt.month.isin(selected_months)]
 
 if not plot_df.empty:
+    # We want Debit (Total_Spent) = red, Credit (Total_Credit) = green
+    cols = []
     show_debit = st.sidebar.checkbox("Show Debit (Total_Spent)", True)
     show_credit = st.sidebar.checkbox("Show Credit (Total_Credit)", True)
-    cols = []
     if show_debit: cols.append("Total_Spent")
     if show_credit: cols.append("Total_Credit")
-    plot_df["Date"] = pd.to_datetime(plot_df["Date"], errors="coerce")
-    st.line_chart(plot_df.set_index("Date")[cols])
+
+    # Melt to long format for altair
+    # Ensure the columns exist; if not, fill with zeros
+    for col in ["Total_Spent", "Total_Credit"]:
+        if col not in plot_df.columns:
+            plot_df[col] = 0.0
+    long = plot_df[["Date", "Total_Spent", "Total_Credit"]].melt(id_vars=["Date"],
+                                                                  value_vars=["Total_Spent", "Total_Credit"],
+                                                                  var_name="Type",
+                                                                  value_name="Amount")
+    long["Type"] = long["Type"].map({"Total_Spent": "Debit", "Total_Credit": "Credit"})
+    if cols:
+        # filter to selected series
+        desired_map = {"Total_Spent": "Debit", "Total_Credit": "Credit"}
+        selected_types = [desired_map[c] for c in cols]
+        long = long[long["Type"].isin(selected_types)]
+
+    chart = alt.Chart(long).mark_line(point=True).encode(
+        x=alt.X("Date:T", title="Date"),
+        y=alt.Y("Amount:Q", title="Amount (₹)"),
+        color=alt.Color("Type:N",
+                        scale=alt.Scale(domain=["Debit", "Credit"], range=["red", "green"]),
+                        legend=alt.Legend(title="Type")),
+        tooltip=[alt.Tooltip("Date:T"), alt.Tooltip("Type:N"), alt.Tooltip("Amount:Q", format=",")]
+    ).properties(height=350)
+
+    st.altair_chart(chart, use_container_width=True)
 else:
     st.info("No data for selected filters.")
 
@@ -223,6 +279,7 @@ if io_mod is not None:
     st.write("🗑️ Bulk actions (Soft Delete)")
     selectable_labels = []
     label_to_target = {}
+    # For the labels we keep the mapping to the original sheet & original _sheet_row_idx
     for i, r in rows_df.iterrows():
         label = f"{i+1} | {r.get('Bank','')} | {r.get('timestamp','')} | ₹{r.get('Amount','')} | {r.get('Message','')[:50]}"
         src = r.get("_source_sheet", "history")
