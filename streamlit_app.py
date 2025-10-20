@@ -60,19 +60,22 @@ def _get_creds_info():
         return io_mod.parse_service_account_secret(st.secrets["gcp_service_account"])
     return None
 
+
 def _read_sheet_with_index(spreadsheet_id, range_name, source_name, creds_info):
     df = io_mod.read_google_sheet(spreadsheet_id, range_name, creds_info=creds_info, creds_file=None)
     df = df.reset_index(drop=True)
     if not df.empty:
-        df['_sheet_row_idx'] = df.index.astype(int)  # 0-based relative to sheet data rows
+        df['_sheet_row_idx'] = df.index.astype(int)
     df['_source_sheet'] = source_name
     return df
+
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_sheets(spreadsheet_id, range_hist, range_append, creds_info, reload_key):
     hist_df = _read_sheet_with_index(spreadsheet_id, range_hist, "history", creds_info)
     app_df = _read_sheet_with_index(spreadsheet_id, range_append, "append", creds_info)
     return hist_df, app_df
+
 
 # ------------------ Fetch Data ------------------
 creds_info = _get_creds_info()
@@ -88,33 +91,24 @@ if history_df.empty and append_df.empty:
     st.error("No data found in the Google Sheets.")
     st.stop()
 
-# Combine sheets
 sheet_full_df = pd.concat([history_df, append_df], ignore_index=True, sort=False)
+
 
 # ---------------- Safe UID creation helper ----------------
 def _safe_col_as_str_series(df: pd.DataFrame, colname: str) -> pd.Series:
-    """
-    Return a pd.Series of strings for df[colname] if present; otherwise
-    return a Series of empty strings of the same length as df.
-    This avoids errors when using .astype on a fallback scalar.
-    """
     if colname in df:
-        # Convert values to string safely
         return df[colname].astype(object).fillna("").astype(str)
-    # Return an empty-string series with the same length
     return pd.Series([""] * len(df), index=df.index, dtype=str)
 
+
 # ---------- Soft-delete normalization + dedupe logic ----------
-# Normalize is_deleted to boolean mask
 if 'is_deleted' in sheet_full_df.columns:
     sheet_full_df['is_deleted_bool'] = sheet_full_df['is_deleted'].astype(str).str.lower().isin(['true','t','1','yes'])
 else:
     sheet_full_df['is_deleted_bool'] = False
 
-# Build deterministic _uid for a logical record so duplicates across sheets can be detected.
 part_ts = _safe_col_as_str_series(sheet_full_df, 'timestamp')
 part_date = _safe_col_as_str_series(sheet_full_df, 'date')
-# prefer timestamp over date when both exist
 time_series = part_ts.where(part_ts != "", part_date)
 uid = (
     time_series.fillna("").astype(str).str.strip() + '|' +
@@ -125,25 +119,23 @@ uid = (
 )
 sheet_full_df['_uid'] = uid
 
-# If ANY copy of a uid is marked deleted, remove all copies of that uid (prevents resurrection)
 deleted_uids = sheet_full_df.loc[sheet_full_df['is_deleted_bool'], '_uid'].unique()
 if len(deleted_uids) > 0:
     sheet_full_df = sheet_full_df.loc[~sheet_full_df['_uid'].isin(deleted_uids)].copy()
 
-# Deduplicate duplicates (prefer history over append)
 src_rank_map = {'history': 0, 'append': 1}
 sheet_full_df['_src_rank'] = sheet_full_df['_source_sheet'].map(src_rank_map).fillna(1)
 sheet_full_df = sheet_full_df.sort_values(['_uid', '_src_rank']).drop_duplicates('_uid', keep='first').reset_index(drop=True)
 
-# Build the visible dataframe (df_raw) — after deletion/dedupe
 df_raw = sheet_full_df.copy()
-
 if df_raw.empty:
     st.warning("No visible data after filtering deleted rows.")
     st.stop()
 
+
 # ------------------ Transform ------------------
 converted_df = transform.convert_columns_and_derives(df_raw)
+
 
 # ------------------ Bank Detection ------------------
 def add_bank_column(df: pd.DataFrame) -> pd.DataFrame:
@@ -156,13 +148,14 @@ def add_bank_column(df: pd.DataFrame) -> pd.DataFrame:
     )
     return df
 
+
 converted_df = add_bank_column(converted_df)
+
 
 # ------------------ Sidebar Filters ------------------
 st.sidebar.header("Filters")
 banks = sorted(converted_df["Bank"].dropna().unique().tolist())
 sel_banks = st.sidebar.multiselect("Banks", options=banks, default=banks)
-
 filtered_df = converted_df[converted_df["Bank"].isin(sel_banks)] if sel_banks else converted_df
 
 with st.spinner("Computing daily totals..."):
@@ -181,15 +174,16 @@ if not merged.empty:
 else:
     sel_year, sel_months = "All", []
 
-# ------------------ Date Range ------------------ 
+
+# ------------------ Date Range ------------------
 tmp = filtered_df.copy()
 tmp["timestamp"] = pd.to_datetime(tmp.get("timestamp", tmp.get("date")), errors="coerce")
 valid_dates = tmp["timestamp"].dropna()
 if valid_dates.empty:
     st.error("No valid dates found.")
     st.stop()
-min_date, max_date = valid_dates.min().date(), valid_dates.max().date()
 
+min_date, max_date = valid_dates.min().date(), valid_dates.max().date()
 totals_mode = st.sidebar.radio("Totals mode", ["Single date", "Date range"], index=0)
 today = datetime.utcnow().date()
 default_date = max(min_date, min(today, max_date))
@@ -200,6 +194,7 @@ if totals_mode == "Single date":
 else:
     dr = st.sidebar.date_input("Pick start & end", value=(min_date, max_date), min_value=min_date, max_value=max_date)
     start_sel, end_sel = dr if isinstance(dr, (tuple, list)) else (dr, dr)
+
 
 # ------------------ Totals ------------------
 try:
@@ -228,6 +223,7 @@ try:
 except Exception as e:
     st.error(f"Failed to compute totals: {e}")
 
+
 # ------------------ Charts ------------------
 st.subheader("📊 Charts")
 plot_df = merged.copy()
@@ -238,108 +234,22 @@ if sel_months:
     selected_months = [inv_map[m] for m in sel_months if m in inv_map]
     plot_df = plot_df[plot_df["Date"].dt.month.isin(selected_months)]
 
-if plot_df.empty:
-    st.info("No aggregated data for selected filters. Charts not available.")
-else:
-    # Chart type selection UI (supports all three)
+if not plot_df.empty:
     chart_type = st.selectbox("Chart type", ["Daily line", "Monthly bars", "Top categories (Top-N)"])
-
-    # series selection for line / monthly
     show_debit = st.sidebar.checkbox("Show Debit (Total_Spent)", True)
     show_credit = st.sidebar.checkbox("Show Credit (Total_Credit)", True)
     series_selected = []
-    if show_debit:
-        series_selected.append("Total_Spent")
-    if show_credit:
-        series_selected.append("Total_Credit")
-
-    # Top-N param
-    top_n = st.sidebar.slider("Top-N categories", min_value=3, max_value=20, value=5)
-
-    # Use charts_mod if available; else fallback to inline simple chart for Daily line / Monthly bars / Top categories
+    if show_debit: series_selected.append("Total_Spent")
+    if show_credit: series_selected.append("Total_Credit")
+    top_n = st.sidebar.slider("Top-N categories", 3, 20, 5)
     if charts_mod is not None:
         try:
-            # charts_mod.render_chart returns None or clicked date in original design; ignore return here
-            charts_mod.render_chart(plot_df=plot_df, converted_df=filtered_df, chart_type=chart_type,
-                                   series_selected=series_selected, top_n=top_n, height=420)
+            charts_mod.render_chart(plot_df, filtered_df, chart_type, series_selected, top_n=top_n, height=420)
         except Exception as e:
-            st.error("charts module failed to render chart. Falling back to inline chart.")
-            st.exception(e)
-            charts_mod = None  # fall through to inline
-    if charts_mod is None:
-        # Inline fallback implementation (keeps similar visuals)
-        if chart_type == "Daily line":
-            # prepare long
-            for col in ["Total_Spent", "Total_Credit"]:
-                if col not in plot_df.columns:
-                    plot_df[col] = 0.0
-            long = plot_df[["Date", "Total_Spent", "Total_Credit"]].melt(id_vars=["Date"],
-                                                                          value_vars=["Total_Spent", "Total_Credit"],
-                                                                          var_name="Type",
-                                                                          value_name="Amount")
-            long["Type"] = long["Type"].map({"Total_Spent": "Debit", "Total_Credit": "Credit"})
-            if series_selected:
-                desired_map = {"Total_Spent": "Debit", "Total_Credit": "Credit"}
-                selected_types = [desired_map[c] for c in series_selected]
-                long = long[long["Type"].isin(selected_types)]
+            st.error(f"charts module error: {e}")
+else:
+    st.info("No data for selected filters.")
 
-            chart = alt.Chart(long).mark_line(point=True).encode(
-                x=alt.X("Date:T", title="Date"),
-                y=alt.Y("Amount:Q", title="Amount (₹)"),
-                color=alt.Color("Type:N", scale=alt.Scale(domain=["Debit", "Credit"], range=["red", "green"]),
-                                legend=alt.Legend(title="Type")),
-                tooltip=[alt.Tooltip("Date:T"), alt.Tooltip("Type:N"), alt.Tooltip("Amount:Q", format=",")]
-            ).properties(height=350)
-            st.altair_chart(chart, use_container_width=True)
-
-        elif chart_type == "Monthly bars":
-            df = plot_df.copy()
-            df['YearMonth'] = df['Date'].dt.to_period('M').astype(str)
-            vars_to_plot = [c for c in ['Total_Spent', 'Total_Credit'] if c in series_selected and c in df.columns]
-            if not vars_to_plot:
-                st.info("No series selected for plotting.")
-            else:
-                agg = df.groupby('YearMonth')[vars_to_plot].sum().reset_index()
-                long = agg.melt(id_vars='YearMonth', value_vars=vars_to_plot, var_name='Type', value_name='Amount')
-                long['Amount'] = pd.to_numeric(long['Amount'], errors='coerce').fillna(0.0)
-                yearmonth_order = sorted(long['YearMonth'].unique(), key=lambda x: pd.to_datetime(x + "-01"))
-                chart = alt.Chart(long).mark_bar().encode(
-                    x=alt.X('YearMonth:N', sort=yearmonth_order, title='Month'),
-                    y=alt.Y('Amount:Q', title='Amount', axis=alt.Axis(format=",.0f")),
-                    color=alt.Color('Type:N', title='Type', scale=alt.Scale(domain=['Total_Spent', 'Total_Credit'],
-                                                                             range=['#d62728', '#2ca02c'])),
-                    tooltip=[alt.Tooltip('YearMonth:N', title='Month'),
-                             alt.Tooltip('Type:N', title='Type'),
-                             alt.Tooltip('Amount:Q', title='Amount', format=',')]
-                ).properties(height=420).interactive()
-                st.altair_chart(chart, use_container_width=True)
-
-        else:  # Top categories fallback
-            df = filtered_df.copy()
-            df['Amount_numeric'] = pd.to_numeric(df.get('Amount', 0), errors='coerce').fillna(0.0)
-            preferred_cols = ['Category', 'Merchant', 'merchant', 'category', 'description']
-            cat_col = next((c for c in preferred_cols if c in df.columns), None)
-            if cat_col is None:
-                st.info("Top-N chart needs a Category or Merchant column. Rename your column to 'Category' if available.")
-            else:
-                if 'Type' in df.columns:
-                    df['Type_norm'] = df['Type'].astype(str).str.lower().str.strip()
-                    spend_mask = df['Type_norm'] == 'debit'
-                else:
-                    spend_mask = df['Amount_numeric'] > 0
-                spend_df = df[spend_mask].copy()
-                if spend_df.empty:
-                    st.info("No spend (debit) transactions found for Top-N in the dataset.")
-                else:
-                    agg = spend_df.groupby(cat_col)['Amount_numeric'].sum().reset_index().rename(columns={cat_col: 'Category', 'Amount_numeric': 'Total'})
-                    agg = agg.sort_values('Total', ascending=False).head(top_n)
-                    agg['Total'] = agg['Total'].astype(float)
-                    chart = alt.Chart(agg).mark_bar().encode(
-                        x=alt.X('Total:Q', title='Total spend', axis=alt.Axis(format=",.0f")),
-                        y=alt.Y('Category:N', sort='-x', title='Category'),
-                        tooltip=[alt.Tooltip('Category:N', title='Category'), alt.Tooltip('Total:Q', title='Total', format=',')]
-                    ).properties(height=max(200, min(600, 40 * len(agg))))
-                    st.altair_chart(chart, use_container_width=True)
 
 # ------------------ Rows Table ------------------
 st.subheader("Rows (matching selection)")
@@ -347,11 +257,11 @@ rows_df = filtered_df.copy()
 rows_df["timestamp"] = pd.to_datetime(rows_df.get("timestamp", rows_df.get("date")), errors="coerce")
 mask = rows_df["timestamp"].dt.date.between(start_sel, end_sel)
 rows_df = rows_df.loc[mask]
-
 display_cols = [c for c in ["timestamp", "Bank", "Type", "Amount", "Message", "Suspicious"] if c in rows_df.columns]
 st.dataframe(rows_df[display_cols], use_container_width=True, height=420)
 csv_data = rows_df.to_csv(index=False).encode("utf-8")
 st.download_button("📥 Download CSV", csv_data, "transactions.csv", "text/csv")
+
 
 # ------------------ Soft Delete ------------------
 if io_mod is not None:
@@ -359,7 +269,6 @@ if io_mod is not None:
     st.write("🗑️ Bulk actions (Soft Delete)")
     selectable_labels = []
     label_to_target = {}
-    # For the labels we keep the mapping to the original sheet & original _sheet_row_idx
     for i, r in rows_df.iterrows():
         label = f"{i+1} | {r.get('Bank','')} | {r.get('timestamp','')} | ₹{r.get('Amount','')} | {r.get('Message','')[:50]}"
         src = r.get("_source_sheet", "history")
@@ -379,7 +288,8 @@ if io_mod is not None:
         st.session_state.reload_key += 1
         st.experimental_rerun()
 
-# ------------------ Add New Row (fixed: provide multiple date/timestamp keys) ------------------
+
+# ------------------ Add New Row (✅ Fixed date issue) ------------------
 if io_mod is not None:
     st.markdown("---")
     st.write("➕ Add a new transaction")
@@ -390,36 +300,33 @@ if io_mod is not None:
         amount = st.number_input("Amount (₹)", min_value=0.0, step=1.0, format="%.2f")
         msg = st.text_input("Message / Description", "")
         submit_add = st.button("Save new row")
+
         if submit_add:
             dt_combined = datetime.combine(new_date, datetime.utcnow().time())
-            # Provide multiple common column name variants for date/timestamp so the
-            # append helper will find a matching header (DateTime, timestamp, date, Date)
+
+            # ✅ FIX: Excel serial format so Google Sheets shows real date
+            excel_origin = datetime(1899, 12, 30)
+            excel_serial = (dt_combined - excel_origin).days + ((dt_combined - excel_origin).seconds / 86400.0)
+
             timestamp_str = dt_combined.strftime("%Y-%m-%d %H:%M:%S")
             date_str = dt_combined.date().isoformat()
 
             new_row = {
-                # common timestamp column variants (sheet may use DateTime or timestamp)
-                "DateTime": timestamp_str,
-                "timestamp": timestamp_str,
-                # common date-only column variants (sheet may use date or Date)
+                "DateTime": excel_serial,      # Google Sheets stores as date
+                "timestamp": timestamp_str,    # readable
                 "date": date_str,
                 "Date": date_str,
-
-                # other fields
                 "Bank": bank,
                 "Type": txn_type,
                 "Amount": amount,
                 "Message": msg,
-                # ensure explicit is_deleted flag
                 "is_deleted": "false",
             }
 
             res = io_mod.append_new_row(SHEET_ID, APPEND_RANGE, new_row, creds_info=creds_info, history_range=RANGE)
             if isinstance(res, dict) and res.get("status") == "ok":
-                st.success("✅ Row added successfully!")
+                st.success("✅ Row added successfully with correct date format!")
                 st.session_state.reload_key += 1
                 st.experimental_rerun()
             else:
                 st.error(f"Failed to add row: {res}")
-
-# End of streamlit_app.py
