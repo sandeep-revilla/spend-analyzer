@@ -1,251 +1,525 @@
-# streamlit_app.py — Complete Daily Spend Tracker (Google Sheets + Charts + Add Row fix)
-import streamlit as st
+# io_helpers.py -- data I/O helpers (pure functions, no Streamlit runtime objects passed in)
+import json
+import os
+import re
+from typing import Any, Dict, List, Tuple, Optional
+from datetime import datetime, timedelta
+
 import pandas as pd
-import importlib
-from datetime import datetime, timedelta, date, time as dt_time
-import altair as alt
 
-st.set_page_config(page_title="💳 Daily Spend Tracker", layout="wide")
-st.title("💳 Daily Spending")
-
-# ------------------ Module Imports ------------------
+# Optional Google Sheets imports (will raise only when used)
 try:
-    transform = importlib.import_module("transform")
-except Exception as e:
-    st.error("❌ Missing or broken transform.py.")
-    st.exception(e)
-    st.stop()
-
-try:
-    import io_helpers as io_mod
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
 except Exception:
-    io_mod = None
+    service_account = None
+    build = None
+    HttpError = Exception
 
-try:
-    charts_mod = importlib.import_module("charts")
-except Exception:
-    charts_mod = None
 
-# ------------------ Load from Streamlit Secrets ------------------
-_secrets = getattr(st, "secrets", {}) or {}
-SHEET_ID = _secrets.get("SHEET_ID")
-RANGE = _secrets.get("RANGE")
-APPEND_RANGE = _secrets.get("APPEND_RANGE")
-
-if not SHEET_ID or not RANGE or not APPEND_RANGE:
-    st.error("Missing Google Sheet secrets: SHEET_ID, RANGE, APPEND_RANGE.")
-    st.stop()
-
-# ------------------ Session State ------------------
-if "reload_key" not in st.session_state:
-    st.session_state.reload_key = 0
-
-if "last_refreshed" not in st.session_state:
-    st.session_state.last_refreshed = None
-
-# ------------------ Helpers ------------------
-def _get_creds_info():
-    if io_mod is None:
-        return None
+def parse_service_account_secret(raw: Any) -> Dict:
+    """Parse a service account JSON blob stored as dict or string. Returns a plain dict."""
+    if isinstance(raw, dict):
+        return raw
+    s = str(raw).strip()
+    if (s.startswith('"""') and s.endswith('"""')) or (s.startswith("'''") and s.endswith("'''")):
+        s = s[3:-3].strip()
     try:
-        if "gcp_service_account" in st.secrets:
-            return io_mod.parse_service_account_secret(st.secrets["gcp_service_account"])
+        return json.loads(s)
     except Exception:
-        return None
-    return None
+        try:
+            return json.loads(s.replace('\\n', '\n'))
+        except Exception:
+            return json.loads(s.replace('\n', '\\n'))
 
 
-def _read_sheet_with_index(spreadsheet_id, range_name, source_name, creds_info):
-    try:
-        df = io_mod.read_google_sheet(spreadsheet_id, range_name, creds_info=creds_info)
-    except Exception as e:
-        st.error(f"Failed to read sheet '{range_name}': {e}")
+def _normalize_rows(values: List[List[str]]) -> Tuple[List[str], List[List]]:
+    """
+    Convert Google Sheets 'values' (list of rows) into header + normalized rows.
+    If first row looks like a header, use it; otherwise synthesize col_{i} headers.
+    """
+    if not values:
+        return [], []
+    header_row = [str(x).strip() for x in values[0]]
+    # if first row looks like "Unnamed" header or blank, synthesize
+    if all((h == "" or h.lower().startswith(("unnamed", "column", "nan"))) for h in header_row):
+        max_cols = max(len(r) for r in values)
+        header = [f"col_{i}" for i in range(max_cols)]
+        data_rows = values
+    else:
+        header = header_row
+        data_rows = values[1:]
+    col_count = len(header)
+    normalized = []
+    for r in data_rows:
+        if len(r) < col_count:
+            r = r + [None] * (col_count - len(r))
+        elif len(r) > col_count:
+            r = r[:col_count]
+        normalized.append(r)
+    return header, normalized
+
+
+def values_to_dataframe(values: List[List[str]]) -> pd.DataFrame:
+    """Turn a Google Sheets 'values' payload into a pandas DataFrame."""
+    if not values:
         return pd.DataFrame()
-    df = df.reset_index(drop=True)
-    if not df.empty:
-        df["_sheet_row_idx"] = df.index.astype(int)
-    df["_source_sheet"] = source_name
+    header, rows = _normalize_rows(values)
+    try:
+        df = pd.DataFrame(rows, columns=header)
+    except Exception:
+        df = pd.DataFrame(rows)
+        if header and df.shape[1] == len(header):
+            df.columns = header
+    # tidy column names
+    df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_sheets(spreadsheet_id, range_hist, range_append, creds_info, reload_key):
-    hist_df = _read_sheet_with_index(spreadsheet_id, range_hist, "history", creds_info)
-    app_df = _read_sheet_with_index(spreadsheet_id, range_append, "append", creds_info)
-    return hist_df, app_df
+def _truthy_is_deleted(val: Any) -> bool:
+    """Interpret a variety of string/number values as deleted True/False."""
+    if val is None:
+        return False
+    s = str(val).strip().lower()
+    return s in ("true", "t", "1", "yes", "y")
 
-# ------------------ Refresh UI ------------------
-col_refresh, col_time = st.columns([1, 3])
-if col_refresh.button("🔁 Refresh Data", use_container_width=True):
-    st.session_state.reload_key += 1
-    st.experimental_rerun()
 
-if st.session_state.last_refreshed:
-    col_time.caption(f"Last refreshed: {st.session_state.last_refreshed.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+def _normalize_is_deleted_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    If 'is_deleted' exists (case-insensitive), rename to canonical 'is_deleted' and
+    canonicalize values to uppercase 'TRUE'/'FALSE' strings for stable round-trip writes.
+    """
+    cols = list(df.columns)
+    lower_map = {c.lower(): c for c in cols}
+    if "is_deleted" in lower_map:
+        orig = lower_map["is_deleted"]
+        if orig != "is_deleted":
+            df = df.rename(columns={orig: "is_deleted"})
+        df["is_deleted"] = df["is_deleted"].apply(lambda v: "TRUE" if _truthy_is_deleted(v) else "FALSE")
+    return df
 
-# ------------------ Fetch Data ------------------
-creds_info = _get_creds_info()
-if creds_info is None:
-    st.error("Missing Google credentials (gcp_service_account).")
-    st.stop()
 
-with st.spinner("Fetching Google Sheets..."):
-    history_df, append_df = fetch_sheets(SHEET_ID, RANGE, APPEND_RANGE, creds_info, st.session_state.reload_key)
-    st.session_state.last_refreshed = datetime.utcnow()
+def build_sheets_service_from_info(creds_info: Dict):
+    """Create Google Sheets API service from service-account info dict (read-only scope)."""
+    if service_account is None or build is None:
+        raise RuntimeError("google-auth or google-api-client not installed.")
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
-if history_df.empty and append_df.empty:
-    st.error("No data found in the Google Sheet.")
-    st.stop()
 
-df_raw = pd.concat([history_df, append_df], ignore_index=True, sort=False)
+def build_sheets_service_from_file(creds_file: str):
+    """Create Google Sheets API service from local service-account JSON file path (read-only scope)."""
+    if service_account is None or build is None:
+        raise RuntimeError("google-auth or google-api-client not installed.")
+    if not os.path.exists(creds_file):
+        raise FileNotFoundError(f"Credentials file not found: {creds_file}")
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+    creds = service_account.Credentials.from_service_account_file(creds_file, scopes=scopes)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
-# ------------------ Filter Deleted ------------------
-if "is_deleted" in df_raw.columns:
-    mask = df_raw["is_deleted"].astype(str).str.lower().isin(["true", "t", "1", "yes"])
-    df_raw = df_raw.loc[~mask].copy()
 
-if df_raw.empty:
-    st.warning("No visible rows (after filtering deleted entries).")
-    st.stop()
+def build_sheets_service_write_from_info(creds_info: Dict):
+    """Create Google Sheets API service from service-account info dict (write access)."""
+    if service_account is None or build is None:
+        raise RuntimeError("google-auth or google-api-client not installed.")
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=scopes)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
-# ------------------ Transform ------------------
-converted_df = transform.convert_columns_and_derives(df_raw)
 
-if "Bank" not in converted_df.columns:
-    converted_df["Bank"] = "Unknown"
+def build_sheets_service_write_from_file(creds_file: str):
+    """Create Google Sheets API service from local service-account JSON file path (write access)."""
+    if service_account is None or build is None:
+        raise RuntimeError("google-auth or google-api-client not installed.")
+    if not os.path.exists(creds_file):
+        raise FileNotFoundError(f"Credentials file not found: {creds_file}")
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = service_account.Credentials.from_service_account_file(creds_file, scopes=scopes)
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
-# ------------------ Sidebar Filters ------------------
-st.sidebar.header("Filters")
-banks = sorted(converted_df["Bank"].dropna().unique().tolist())
-sel_banks = st.sidebar.multiselect("Banks", options=banks, default=banks)
-filtered_df = converted_df[converted_df["Bank"].isin(sel_banks)]
 
-with st.spinner("Computing daily totals..."):
-    merged = transform.compute_daily_totals(filtered_df)
+def read_google_sheet(spreadsheet_id: str, range_name: str,
+                      creds_info: Optional[Dict] = None, creds_file: Optional[str] = None) -> pd.DataFrame:
+    """
+    Read a Google Sheet and return a pandas DataFrame.
+    - creds_info: parsed JSON dict for service account (plain dict) OR None
+    - creds_file: path to service account JSON on disk OR None
 
-if not merged.empty:
-    merged["Date"] = pd.to_datetime(merged["Date"]).dt.normalize()
+    IMPORTANT: Do NOT pass Streamlit runtime objects to this function.
+    This function does NOT perform caching; callers may implement caching if desired.
 
-# ------------------ Date Range ------------------
-if "timestamp" in filtered_df.columns:
-    filtered_df["timestamp"] = pd.to_datetime(filtered_df["timestamp"], errors="coerce")
-else:
-    filtered_df["timestamp"] = pd.to_datetime(filtered_df.get("date"), errors="coerce")
+    The returned DataFrame will have normalized column names and, if an is_deleted column
+    exists, it will be canonicalized to 'TRUE'/'FALSE' strings stored in the 'is_deleted' column.
+    """
+    if creds_info is None and (creds_file is None or not os.path.exists(creds_file)):
+        raise ValueError("No credentials found. Provide creds_info (plain dict) or a valid creds_file path.")
 
-valid_dates = filtered_df["timestamp"].dropna()
-if valid_dates.empty:
-    st.warning("No valid dates found.")
-    st.stop()
-
-min_date, max_date = valid_dates.min().date(), valid_dates.max().date()
-today = datetime.utcnow().date()
-
-totals_mode = st.sidebar.radio("Totals mode", ["Single date", "Date range"], index=0)
-
-if totals_mode == "Single date":
-    sel_date = st.sidebar.date_input("Pick date", value=today, min_value=min_date, max_value=max_date)
-    start_sel, end_sel = sel_date, sel_date
-else:
-    dr = st.sidebar.date_input("Pick date range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
-    if isinstance(dr, (tuple, list)) and len(dr) == 2:
-        start_sel, end_sel = dr
+    if creds_info is not None:
+        service = build_sheets_service_from_info(creds_info)
     else:
-        start_sel, end_sel = dr, dr
+        service = build_sheets_service_from_file(creds_file)
 
-# ------------------ Totals ------------------
-tmp = filtered_df.copy()
-mask = tmp["timestamp"].dt.date.between(start_sel, end_sel)
-sel_df = tmp.loc[mask]
+    try:
+        sheet = service.spreadsheets()
+        res = sheet.values().get(spreadsheetId=spreadsheet_id, range=range_name).execute()
+        values = res.get("values", [])
+    except HttpError as e:
+        raise RuntimeError(f"Google Sheets API error: {e}")
 
-amt_col = next((c for c in sel_df.columns if c.lower() == "amount"), None)
-type_col = next((c for c in sel_df.columns if c.lower() == "type"), None)
-credit_sum = debit_sum = credit_count = debit_count = 0
+    df = values_to_dataframe(values)
+    df = _normalize_is_deleted_column(df)
+    return df
 
-if amt_col:
-    sel_df["amt"] = pd.to_numeric(sel_df[amt_col], errors="coerce").fillna(0.0)
-    if type_col:
-        sel_df["type_norm"] = sel_df[type_col].astype(str).str.lower()
-        credit_mask = sel_df["type_norm"] == "credit"
-        debit_mask = sel_df["type_norm"] == "debit"
-        credit_sum = sel_df.loc[credit_mask, "amt"].sum()
-        debit_sum = sel_df.loc[debit_mask, "amt"].sum()
-        credit_count = int(credit_mask.sum())
-        debit_count = int(debit_mask.sum())
 
-c1, c2, c3 = st.columns(3)
-c1.metric("Credits", f"₹{credit_sum:,.0f}", f"{credit_count} txns")
-c2.metric("Debits", f"₹{debit_sum:,.0f}", f"{debit_count} txns")
-c3.metric("Net", f"₹{(credit_sum - debit_sum):,.0f}")
+# ---------------------------------------------------------------------
+# New write helpers (ensure headers sync between history + append, safe append)
+# ---------------------------------------------------------------------
 
-# ------------------ Charts ------------------
-st.subheader("📊 Charts")
-if not merged.empty and charts_mod is not None:
-    chart_type = st.selectbox("Chart type", ["Daily line", "Monthly bars", "Top categories (Top-N)"], index=0)
-    series_selected = []
-    if st.sidebar.checkbox("Show Debit (Total_Spent)", True):
-        series_selected.append("Total_Spent")
-    if st.sidebar.checkbox("Show Credit (Total_Credit)", True):
-        series_selected.append("Total_Credit")
-    top_n = st.sidebar.slider("Top-N categories", 3, 20, 5)
-    charts_mod.render_chart(merged, filtered_df, chart_type, series_selected, top_n=top_n, height=420)
-else:
-    st.info("No data for charts.")
 
-# ------------------ Rows Table ------------------
-st.subheader("Rows (matching selection)")
-rows_df = filtered_df.copy()
-mask = rows_df["timestamp"].dt.date.between(start_sel, end_sel)
-rows_df = rows_df.loc[mask]
+def _get_write_service(creds_info: Optional[Dict] = None, creds_file: Optional[str] = None):
+    """
+    Return a Google Sheets service with write access.
+    Prefers creds_info (plain dict). If not provided, uses creds_file path.
+    """
+    if creds_info is None and (creds_file is None or not os.path.exists(creds_file)):
+        raise ValueError("No credentials found for write operation. Provide creds_info or a valid creds_file path.")
+    if creds_info is not None:
+        return build_sheets_service_write_from_info(creds_info)
+    else:
+        return build_sheets_service_write_from_file(creds_file)
 
-display_cols = [c for c in ["timestamp", "Bank", "Type", "Amount", "Message"] if c in rows_df.columns]
-st.dataframe(rows_df[display_cols], use_container_width=True, height=420)
 
-csv_data = rows_df.to_csv(index=False).encode("utf-8")
-st.download_button("📥 Download CSV", csv_data, "transactions.csv", "text/csv")
+def ensure_sheet_headers_match(spreadsheet_id: str,
+                               history_range: Optional[str],
+                               append_range: str,
+                               creds_info: Optional[Dict] = None,
+                               creds_file: Optional[str] = None) -> Dict:
+    """
+    Ensure the Append sheet header contains all columns present in the History sheet header.
+    - If append sheet is missing columns from history, add them to the end of the append header
+      and extend existing data rows with empty cells so columns align.
+    - If history_range is None, this becomes a no-op (returns ok).
+    Returns dict {status: 'ok'|'error', 'added': [cols], 'message': str}
+    """
+    service = _get_write_service(creds_info, creds_file)
+    sheet = service.spreadsheets()
 
-# ------------------ Add New Row (✅ FIXED DATE FORMAT) ------------------
-st.markdown("---")
-st.write("➕ Add a new transaction")
+    # Read history header
+    history_header = []
+    if history_range:
+        try:
+            res_h = sheet.values().get(spreadsheetId=spreadsheet_id, range=history_range).execute()
+            vals_h = res_h.get("values", [])
+            if vals_h:
+                history_header = [str(x).strip() for x in vals_h[0]]
+        except HttpError as e:
+            return {"status": "error", "message": f"Failed to read history sheet header: {e}"}
 
-if io_mod is not None:
-    with st.expander("Add new row"):
-        with st.form("add_row_form", clear_on_submit=True):
-            new_date = st.date_input("Date", value=datetime.utcnow().date())
-            bank = st.text_input("Bank", "HDFC Bank")
-            txn_type = st.selectbox("Type", ["debit", "credit"])
-            amount = st.number_input("Amount (₹)", min_value=0.0, step=1.0, format="%.2f")
-            msg = st.text_input("Message / Description", "")
-            submit_add = st.form_submit_button("Save new row")
+    # Read append sheet header + data rows
+    try:
+        res_a = sheet.values().get(spreadsheetId=spreadsheet_id, range=append_range).execute()
+        vals_a = res_a.get("values", [])
+    except HttpError as e:
+        return {"status": "error", "message": f"Failed to read append sheet: {e}"}
 
-            if submit_add:
-                # ✅ FIX: Use human-readable date/time (ISO 8601)
-                dt_combined = datetime.combine(new_date, datetime.utcnow().time())
-                timestamp_str = dt_combined.strftime("%Y-%m-%d %H:%M:%S")
+    append_header, append_rows = _normalize_rows(vals_a)
 
-                new_row = {
-                    "DateTime": timestamp_str,  # Sheets will recognize this as a date
-                    "timestamp": timestamp_str,
-                    "date": new_date.isoformat(),
-                    "Bank": bank,
-                    "Type": txn_type,
-                    "Amount": amount,
-                    "Message": msg,
-                    "is_deleted": "false",
-                }
+    # If append is empty and history header exists, create append header from history header
+    if (not append_header or all((h == "" for h in append_header))) and history_header:
+        append_header = history_header.copy()
+        try:
+            sheet.values().update(
+                spreadsheetId=spreadsheet_id,
+                range=append_range,
+                valueInputOption='USER_ENTERED',
+                body={'values': [append_header]}
+            ).execute()
+            return {"status": "ok", "added": append_header, "message": "Append header created from history."}
+        except HttpError as e:
+            return {"status": "error", "message": f"Failed to create append header: {e}"}
 
+    if not history_header:
+        return {"status": "ok", "added": [], "message": "No history header provided; nothing to add."}
+
+    lower_append = [h.lower() for h in append_header]
+    missing = [h for h in history_header if h.lower() not in lower_append]
+
+    if not missing:
+        return {"status": "ok", "added": [], "message": "Append header already contains all history columns."}
+
+    new_header = append_header + missing
+    for i in range(len(append_rows)):
+        append_rows[i] = append_rows[i] + [None] * len(missing)
+
+    out_values = [new_header] + append_rows
+    try:
+        sheet.values().update(
+            spreadsheetId=spreadsheet_id,
+            range=append_range,
+            valueInputOption='USER_ENTERED',
+            body={'values': out_values}
+        ).execute()
+    except HttpError as e:
+        return {"status": "error", "message": f"Failed to update append header: {e}"}
+
+    return {"status": "ok", "added": missing, "message": f"Added {len(missing)} columns to append header."}
+
+
+def mark_rows_deleted(spreadsheet_id: str, range_name: str,
+                      creds_info: Optional[Dict] = None, creds_file: Optional[str] = None,
+                      row_indices: Optional[List[int]] = None) -> Dict:
+    """
+    Soft-delete rows by setting / creating an 'is_deleted' column and marking the specified
+    rows as TRUE.
+
+    - spreadsheet_id, range_name: passed to Sheets API (range_name commonly a sheet name like 'History Transactions' or 'Append Transactions').
+    - creds_info: plain dict from parse_service_account_secret OR creds_file: path on disk.
+    - row_indices: list of integers (0-based) referring to the data rows (first data row after header is index 0).
+      If None or empty -> nothing is changed.
+
+    Returns: dict with status and count of rows updated.
+    """
+    if not row_indices:
+        return {"status": "no-op", "updated": 0, "message": "No row indices provided."}
+
+    service = _get_write_service(creds_info, creds_file)
+    sheet = service.spreadsheets()
+
+    try:
+        res = sheet.values().get(spreadsheetId=spreadsheet_id, range=range_name).execute()
+        values = res.get("values", [])
+    except HttpError as e:
+        return {"status": "error", "message": f"Failed to read sheet: {e}"}
+
+    header, data_rows = _normalize_rows(values)
+    if not header:
+        return {"status": "error", "message": "Sheet appears empty, cannot mark rows deleted."}
+
+    lower_header = [h.lower() for h in header]
+    if "is_deleted" not in lower_header:
+        header.append("is_deleted")
+        is_deleted_idx = len(header) - 1
+        for i in range(len(data_rows)):
+            data_rows[i].append(None)
+    else:
+        is_deleted_idx = next(i for i, h in enumerate(header) if h.lower() == "is_deleted")
+
+    updated = 0
+    for idx in row_indices:
+        if isinstance(idx, int) and 0 <= idx < len(data_rows):
+            data_rows[idx][is_deleted_idx] = "TRUE"
+            updated += 1
+
+    out_values = [header] + data_rows
+    try:
+        sheet.values().update(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+            valueInputOption='USER_ENTERED',
+            body={'values': out_values}
+        ).execute()
+    except HttpError as e:
+        return {"status": "error", "message": f"Failed to write sheet: {e}"}
+
+    return {"status": "ok", "updated": updated}
+
+
+def append_new_row(spreadsheet_id: str, range_name: str, new_row_dict: Dict[str, Any],
+                   creds_info: Optional[Dict] = None, creds_file: Optional[str] = None,
+                   history_range: Optional[str] = None) -> Dict:
+    """
+    Append a new row to the sheet (Append sheet). Optionally synchronize headers with History sheet
+    before appending by providing history_range (sheet/tab name or A1-range for history header).
+
+    - spreadsheet_id: spreadsheet id (same spreadsheet that holds history + append or the target spreadsheet)
+    - range_name: append sheet name/range (e.g., 'Append Transactions')
+    - new_row_dict: mapping of column name -> value for the new row. Keys are matched to existing header names
+      case-insensitively. Missing header columns will be left blank.
+    - history_range: optional history sheet range/name to sync headers from prior to append.
+    - Returns a dict with status and the appended row number when available.
+    """
+    # helpers for number/date detection & excel serial conversion
+    def _is_number_like(x):
+        if isinstance(x, (int, float)):
+            return True
+        if isinstance(x, str):
+            s = x.strip()
+            return bool(re.match(r"^\d+(\.\d+)?$", s))
+        return False
+
+    def _to_datetime_if_excel_serial(val_float: float) -> datetime:
+        # Excel serial date to python datetime:
+        # using epoch 1899-12-30 handles Excel serial numbers cross-platform (common approach)
+        excel_epoch = datetime(1899, 12, 30)
+        return excel_epoch + timedelta(days=val_float)
+
+    service = _get_write_service(creds_info, creds_file)
+    sheet = service.spreadsheets()
+
+    # Optionally ensure headers match (synchronize append header to include history columns)
+    if history_range:
+        try:
+            ensure_res = ensure_sheet_headers_match(spreadsheet_id=spreadsheet_id,
+                                                   history_range=history_range,
+                                                   append_range=range_name,
+                                                   creds_info=creds_info,
+                                                   creds_file=creds_file)
+            if ensure_res.get("status") != "ok":
+                return {"status": "error", "message": f"Failed to ensure headers match: {ensure_res.get('message')}"}
+        except Exception as e:
+            return {"status": "error", "message": f"Error while ensuring headers: {e}"}
+
+    try:
+        res = sheet.values().get(spreadsheetId=spreadsheet_id, range=range_name).execute()
+        values = res.get("values", [])
+    except HttpError as e:
+        return {"status": "error", "message": f"Failed to read sheet before append: {e}"}
+
+    header, data_rows = _normalize_rows(values)
+
+    if not header:
+        header = list(new_row_dict.keys())
+        data_rows = []
+        try:
+            sheet.values().update(
+                spreadsheetId=spreadsheet_id,
+                range=range_name,
+                valueInputOption="USER_ENTERED",
+                body={"values": [header]}
+            ).execute()
+        except HttpError as e:
+            return {"status": "error", "message": f"Failed to write header to empty append sheet: {e}"}
+
+    lower_header = [h.lower() for h in header]
+    if "is_deleted" not in lower_header:
+        header.append("is_deleted")
+        for i in range(len(data_rows)):
+            data_rows[i].append(None)
+        # persist header change
+        try:
+            sheet.values().update(
+                spreadsheetId=spreadsheet_id,
+                range=range_name,
+                valueInputOption="USER_ENTERED",
+                body={"values": [header] + data_rows}
+            ).execute()
+        except HttpError as e:
+            return {"status": "error", "message": f"Failed to add is_deleted column to append sheet: {e}"}
+
+    # Build row in header order (case-insensitive matching)
+    row_out: List[Any] = []
+
+    # case-insensitive key map for new_row_dict
+    key_map = {k.lower(): k for k in new_row_dict.keys()}
+
+    for col in header:
+        # find value case-insensitively
+        v = None
+        if col in new_row_dict:
+            v = new_row_dict[col]
+        else:
+            lookup = key_map.get(col.lower())
+            if lookup is not None:
+                v = new_row_dict.get(lookup)
+            else:
+                v = None
+
+        # default for is_deleted
+        if str(col).lower() == "is_deleted" and (v is None):
+            v = "false"
+
+        # Normalize / convert values
+        if v is None:
+            row_out.append(None)
+            continue
+
+        # pandas Timestamp -> python datetime
+        try:
+            import pandas as _pd
+            if isinstance(v, (_pd.Timestamp,)):
                 try:
-                    res = io_mod.append_new_row(
-                        spreadsheet_id=SHEET_ID,
-                        range_name=APPEND_RANGE,
-                        new_row_dict=new_row,
-                        creds_info=creds_info,
-                        history_range=RANGE,
-                    )
-                    if res.get("status") == "ok":
-                        st.success("✅ Row added successfully with correct date format!")
-                        st.session_state.reload_key += 1
-                        st.experimental_rerun()
+                    row_out.append(v.to_pydatetime().strftime("%Y-%m-%d %H:%M:%S"))
+                except Exception:
+                    row_out.append(str(v))
+                continue
+        except Exception:
+            pass
+
+        # python datetime / date
+        try:
+            from datetime import datetime as _dt, date as _date
+            if isinstance(v, (_dt, _date)):
+                try:
+                    if isinstance(v, _date) and not isinstance(v, _dt):
+                        row_out.append(v.isoformat())
                     else:
-                        st.error(f"Failed to add row: {res}")
-                except Exception as e:
-                    st.error(f"Error adding row: {e}")
+                        row_out.append(v.strftime("%Y-%m-%d %H:%M:%S"))
+                except Exception:
+                    row_out.append(v.isoformat())
+                continue
+        except Exception:
+            pass
+
+        # Detect date-like columns
+        col_lower = str(col).lower()
+        is_date_like_column = ("date" in col_lower) or ("time" in col_lower) or (col_lower in ("timestamp", "datetime"))
+
+        # Numeric or numeric-string -> possibly Excel serial for date-like columns
+        if _is_number_like(v) and is_date_like_column:
+            try:
+                val_float = float(v)
+                # Heuristic: convert any numeric in date-like column using Excel serial epoch
+                dt = _to_datetime_if_excel_serial(val_float)
+                row_out.append(dt.strftime("%Y-%m-%d %H:%M:%S"))
+                continue
+            except Exception:
+                # fallback to next handling
+                pass
+
+        # If numeric and not date-like, preserve numeric
+        if isinstance(v, (int, float)):
+            row_out.append(v)
+            continue
+
+        # Strings -> strip and keep
+        if isinstance(v, str):
+            s = v.strip()
+            row_out.append(s)
+            continue
+
+        # Fallback: attempt isoformat or str()
+        try:
+            if hasattr(v, "isoformat"):
+                row_out.append(v.isoformat())
+            else:
+                row_out.append(str(v))
+        except Exception:
+            row_out.append("")
+
+    try:
+        append_res = sheet.values().append(
+            spreadsheetId=spreadsheet_id,
+            range=range_name,
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row_out]}
+        ).execute()
+    except HttpError as e:
+        return {"status": "error", "message": f"Failed to append row: {e}"}
+
+    appended_row_number = None
+    try:
+        updated_range = append_res.get("updates", {}).get("updatedRange") or append_res.get("updatedRange")
+        if updated_range and "!" in updated_range:
+            rng = updated_range.split("!")[1]
+            if ":" in rng:
+                last = rng.split(":")[-1]
+                m = re.search(r"(\d+)", last)
+                if m:
+                    appended_row_number = int(m.group(1))
+    except Exception:
+        appended_row_number = None
+
+    return {"status": "ok", "appended_row_number": appended_row_number, "append_response": append_res}
