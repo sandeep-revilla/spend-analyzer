@@ -71,6 +71,7 @@ def main():
         - _source_sheet: 'history' or 'append' indicating which sheet the row came from
         """
         try:
+            # Note: io_helpers.read_google_sheet should already use a wide A1 range fallback (A:AZ)
             df = io_mod.read_google_sheet(spreadsheet_id, range_name, creds_info=creds_info)
         except Exception as e:
             st.error(f"Failed to read sheet '{range_name}': {e}")
@@ -114,6 +115,7 @@ def main():
         st.error("No data found in the Google Sheet.")
         return
 
+    # keep df_raw (concatenation of both sheets) for possible mapping restoration
     df_raw = pd.concat([history_df, append_df], ignore_index=True, sort=False)
 
     # ------------------ Filter Deleted ------------------
@@ -127,12 +129,22 @@ def main():
 
     # ------------------ Transform ------------------
     try:
-        converted_df = transform.convert_columns_and_derives(df_raw)
+        converted_df = transform.convert_columns_and_derives(df_raw.copy())
     except Exception as e:
         st.error("Error while transforming sheet data (convert_columns_and_derives). See traceback below.")
         st.exception(e)
         st.text(traceback.format_exc())
         return
+
+    # If transform dropped the internal mapping columns but the row counts match, restore them
+    try:
+        if ("_sheet_row_idx" not in converted_df.columns or "_source_sheet" not in converted_df.columns):
+            if ("_sheet_row_idx" in df_raw.columns) and ("_source_sheet" in df_raw.columns) and (len(df_raw) == len(converted_df)):
+                converted_df["_sheet_row_idx"] = df_raw["_sheet_row_idx"].reset_index(drop=True)
+                converted_df["_source_sheet"] = df_raw["_source_sheet"].reset_index(drop=True)
+    except Exception:
+        # non-fatal: proceed without mapping if we can't restore
+        pass
 
     # Ensure timestamp column is parsed early so we can compute month options
     if "timestamp" in converted_df.columns:
@@ -365,22 +377,31 @@ def main():
                         st.session_state.reload_key += 1
                         st.experimental_rerun()
 
-    # ------------------ Add New Row (date picker only) ------------------
+    # ------------------ Add New Row (date + time picker) ------------------
     st.markdown("---")
     st.write("➕ Add a new transaction")
 
-    def parse_input_datetime(date_picker_value: date) -> str:
+    def build_timestamp_str(chosen_date: date, chosen_time: dt_time) -> str:
         """
-        Returns a timestamp string in 'YYYY-MM-DD HH:MM:SS' format
-        by combining the chosen date with the current UTC time.
+        Format datetime in 'YYYY-MM-DD HH:MM:SS' using chosen date + chosen time.
+        chosen_time is a datetime.time object; if None, use current UTC time.
         """
-        dt_combined = datetime.combine(date_picker_value, datetime.utcnow().time())
-        return dt_combined.strftime("%Y-%m-%d %H:%M:%S")
+        if chosen_time is None:
+            t = datetime.utcnow().time()
+        else:
+            t = chosen_time
+        try:
+            dt_combined = datetime.combine(chosen_date, t)
+        except Exception:
+            dt_combined = datetime.utcnow()
+        return dt_combined.strftime("%Y-%m-%d %H:%M:%S"), dt_combined
 
     if io_mod is not None:
         with st.expander("Add new row"):
             with st.form("add_row_form", clear_on_submit=True):
                 new_date = st.date_input("Date (picker)", value=datetime.utcnow().date())
+                # new: time picker so user can specify the exact time that will be saved
+                new_time = st.time_input("Time (UTC)", value=datetime.utcnow().time())
                 bank = st.text_input("Bank", "HDFC Bank")
                 txn_type = st.selectbox("Type", ["debit", "credit"])
                 amount = st.number_input("Amount (₹)", min_value=0.0, step=1.0, format="%.2f")
@@ -389,11 +410,11 @@ def main():
 
                 if submit_add:
                     try:
-                        timestamp_str = parse_input_datetime(new_date)
+                        timestamp_str, timestamp_dt = build_timestamp_str(new_date, new_time)
 
                         new_row = {
                             "DateTime": timestamp_str,
-                            "timestamp": timestamp_str,
+                            "timestamp": timestamp_dt,
                             "date": new_date.isoformat(),
                             "Bank": bank,
                             "Type": txn_type,
@@ -410,9 +431,9 @@ def main():
                             history_range=RANGE,
                         )
 
-                        # Do not show debug append response here (removed per request).
                         if res.get("status") == "ok":
-                            st.success("✅ Row added successfully with correct date format!")
+                            st.success("✅ Row added successfully with correct date & time!")
+                            # force a quick refresh so the appended row is read back
                             st.session_state.reload_key += 1
                             st.experimental_rerun()
                         else:
