@@ -4,9 +4,9 @@ import pandas as pd
 import importlib
 import re
 from datetime import datetime, timedelta, date, time as dt_time
-import altair as alt
 import traceback
 import os
+from typing import Optional
 
 st.set_page_config(page_title="💳 Daily Spend Tracker", layout="wide")
 st.title("💳 Daily Spending")
@@ -64,7 +64,7 @@ def main():
             return None
         return None
 
-    def _read_sheet_with_index(spreadsheet_id, range_name, source_name, creds_info):
+    def _read_sheet_with_index(spreadsheet_id: str, range_name: str, source_name: str, creds_info: Optional[dict]):
         """
         Reads the sheet and ensures two helper columns are present:
         - _sheet_row_idx: 0-based index of the data row (first data row after header is 0)
@@ -83,7 +83,8 @@ def main():
         df["_source_sheet"] = source_name
         return df
 
-    @st.cache_data(ttl=300, show_spinner=False)
+    # Reduce cache TTL while debugging appends so refresh picks up new rows quickly.
+    @st.cache_data(ttl=3, show_spinner=False)
     def fetch_sheets(spreadsheet_id, range_hist, range_append, creds_info, reload_key):
         hist_df = _read_sheet_with_index(spreadsheet_id, range_hist, "history", creds_info)
         app_df = _read_sheet_with_index(spreadsheet_id, range_append, "append", creds_info)
@@ -145,36 +146,68 @@ def main():
     # ------------------ Sidebar Filters ------------------
     st.sidebar.header("Filters")
 
-    # Bank filter (existing)
-    banks = sorted(converted_df["Bank"].dropna().unique().tolist())
-    sel_banks = st.sidebar.multiselect("Banks", options=banks, default=banks)
-
     # Month filter (NEW)
-    # Build month options from converted_df timestamps
     ts_valid = converted_df["timestamp"].dropna()
     if not ts_valid.empty:
-        # months in YYYY-MM format; sort descending (most recent first)
         months = sorted(ts_valid.dt.to_period("M").astype(str).unique(), reverse=True)
     else:
         months = []
     month_options = ["All"] + months
-    sel_month = st.sidebar.selectbox("Month", options=month_options, index=0, help="Select a calendar month to restrict the charts and totals to that month (or choose All).")
+    sel_month = st.sidebar.selectbox("Month", options=month_options, index=0,
+                                     help="Select a calendar month to restrict the charts and totals to that month (or choose All).")
 
-    # Apply bank filter first
+    # ------------------ Main: Bank Filter (with chips) ------------------
+    st.markdown("### Filter by Bank")
+    banks = sorted(converted_df["Bank"].dropna().unique().tolist())
+    sel_banks = st.multiselect("Banks", options=banks, default=banks, key="bank_filter_main")
+
+    # Render visual chips for selected banks (non-interactive — use multiselect to change)
+    if sel_banks:
+        chip_html = "<div style='display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px;'>"
+        for b in sel_banks:
+            chip_html += f"<span style='display:inline-block; background-color:#ff5b57; color:white; padding:8px 12px; border-radius:8px; font-weight:600;'>{b} &nbsp; <span style='opacity:0.9;'>✕</span></span>"
+        chip_html += "</div>"
+        st.markdown(chip_html, unsafe_allow_html=True)
+    else:
+        st.markdown("<div style='color:#666; margin-bottom:10px;'>No banks selected — showing nothing until you select banks.</div>", unsafe_allow_html=True)
+
+    # Apply bank filter
     filtered_df = converted_df[converted_df["Bank"].isin(sel_banks)].copy()
 
     # Apply month filter (if chosen)
     if sel_month != "All" and sel_month:
         try:
-            # sel_month format is "YYYY-MM"
             y, m = sel_month.split("-")
             y = int(y); m = int(m)
             mask_month = (filtered_df["timestamp"].dt.year == y) & (filtered_df["timestamp"].dt.month == m)
             filtered_df = filtered_df.loc[mask_month].copy()
         except Exception:
-            # If parsing fails, do not filter
             pass
 
+    # ------------------ Debug: Raw sheets explorer (expander) ------------------
+    with st.expander("Raw Sheets (debug) — last rows (useful to confirm manual appends are read)"):
+        st.write("History sheet (tail):")
+        try:
+            st.dataframe(history_df.tail(10))
+        except Exception:
+            st.write("No history data.")
+        st.write("Append sheet (tail):")
+        try:
+            st.dataframe(append_df.tail(20))
+        except Exception:
+            st.write("No append data.")
+        st.write("Combined raw (df_raw) tail:")
+        try:
+            st.dataframe(df_raw.tail(20))
+        except Exception:
+            st.write("No combined raw.")
+        st.write("Converted (after transform) tail:")
+        try:
+            st.dataframe(converted_df.tail(20))
+        except Exception:
+            st.write("No converted data.")
+
+    # ------------------ Compute totals and charts ------------------
     with st.spinner("Computing daily totals..."):
         try:
             merged = transform.compute_daily_totals(filtered_df)
@@ -188,11 +221,9 @@ def main():
         merged["Date"] = pd.to_datetime(merged["Date"]).dt.normalize()
 
     # ------------------ Date Range ------------------
-    # Note: filtered_df already has timestamp parsed above, so reuse it.
     if "timestamp" not in filtered_df.columns:
         filtered_df["timestamp"] = pd.to_datetime(filtered_df.get("date"), errors="coerce")
     else:
-        # ensure timestamp column is datetime type
         filtered_df["timestamp"] = pd.to_datetime(filtered_df["timestamp"], errors="coerce")
 
     valid_dates = filtered_df["timestamp"].dropna()
@@ -203,11 +234,9 @@ def main():
     min_date, max_date = valid_dates.min().date(), valid_dates.max().date()
     today = datetime.utcnow().date()
 
-    # SAFETY: ensure min_date <= max_date; if not swap
     if min_date > max_date:
         min_date, max_date = max_date, min_date
 
-    # clamp default selection so Streamlit doesn't raise
     default_sel_date = today
     if default_sel_date < min_date:
         default_sel_date = min_date
@@ -269,7 +298,6 @@ def main():
             series_selected.append("Total_Credit")
         top_n = st.sidebar.slider("Top-N categories", 3, 20, 5)
         try:
-            # charts_mod.render_chart expects merged and filtered_df; pass already-month-filtered versions
             charts_mod.render_chart(merged, filtered_df, chart_type, series_selected, top_n=top_n, height=420)
         except Exception as e:
             st.error("Chart rendering failed. See traceback below.")
@@ -304,47 +332,38 @@ def main():
         else:
             # Build selection choices labeled for readability
             def _label_for_row(r):
-                # prefer timestamp if available, else date
                 ts = r.get("timestamp")
                 bank = r.get("Bank", "")
                 amt = r.get("Amount", "")
                 msg = r.get("Message", "") or r.get("Message", "")
                 src = r.get("_source_sheet", "")
                 idx = r.get("_sheet_row_idx", "")
-                # short message trimmed
                 msg_short = (str(msg)[:40] + "...") if msg and len(str(msg)) > 40 else str(msg)
                 return f"{src}:{idx} — {ts} | {bank} | {amt} | {msg_short}"
 
             choice_map = {}
-            choices = []
-            # iterate rows_df rows and create choices
             for _, row in rows_df.iterrows():
                 key = f"{row['_source_sheet']}:{int(row['_sheet_row_idx'])}"
                 label = _label_for_row(row)
                 choice_map[key] = {"label": label, "source": row["_source_sheet"], "idx": int(row["_sheet_row_idx"])}
-                choices.append(label)  # we'll display labels but need to map back to key - so build alternative mapping
 
-            # To preserve deterministic ordering, build list of keys and labels
             keys_ordered = list(choice_map.keys())
             labels_ordered = [choice_map[k]["label"] for k in keys_ordered]
 
-            # Provide a multiselect with the human-friendly labels
             selected_labels = st.multiselect(
                 "Select rows to remove (soft-delete). Selected rows will be marked is_deleted = TRUE.",
                 options=labels_ordered,
                 default=[]
             )
 
-            # Map selected labels back to keys (could be duplicates if labels collide; labels include idx which is unique)
             selected_keys = []
             for lbl in selected_labels:
-                # find corresponding key(s)
                 for k in keys_ordered:
                     if choice_map[k]["label"] == lbl:
                         selected_keys.append(k)
                         break
 
-            # Confirmation: require checkbox to prevent accidental removal (typed DELETE removed)
+            # Confirmation: require checkbox
             confirm = st.checkbox("I confirm I want to mark the selected rows as deleted")
 
             if st.button("Mark selected rows deleted"):
@@ -353,7 +372,6 @@ def main():
                 elif not confirm:
                     st.warning("Please confirm deletion by checking the box.")
                 else:
-                    # Group by source and call mark_rows_deleted for each sheet separately
                     grouped = {}
                     for k in selected_keys:
                         src, idx_s = k.split(":")
@@ -386,7 +404,6 @@ def main():
     st.markdown("---")
     st.write("➕ Add a new transaction")
 
-    # helper to parse UI input for DateTime (uses only the date picker, combined with current UTC time)
     def parse_input_datetime(date_picker_value: date) -> str:
         """
         Returns a timestamp string in 'YYYY-MM-DD HH:MM:SS' format
@@ -410,7 +427,7 @@ def main():
                         timestamp_str = parse_input_datetime(new_date)
 
                         new_row = {
-                            "DateTime": timestamp_str,  # Sheets will recognize this as a date
+                            "DateTime": timestamp_str,
                             "timestamp": timestamp_str,
                             "date": new_date.isoformat(),
                             "Bank": bank,
@@ -427,6 +444,19 @@ def main():
                             creds_info=creds_info,
                             history_range=RANGE,
                         )
+
+                        # show the append response to help debug and verify row written
+                        st.write("Append response:", res)
+                        # show updatedRange if present
+                        try:
+                            ur = res.get("append_response", {}).get("updates", {}).get("updatedRange") or res.get("append_response", {}).get("updatedRange")
+                            if ur:
+                                st.info(f"API appended to: {ur}")
+                            elif res.get("appended_row_number"):
+                                st.info(f"Appended to row number: {res['appended_row_number']}")
+                        except Exception:
+                            pass
+
                         if res.get("status") == "ok":
                             st.success("✅ Row added successfully with correct date format!")
                             st.session_state.reload_key += 1
