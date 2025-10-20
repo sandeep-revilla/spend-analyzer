@@ -3,6 +3,7 @@ import json
 import os
 import re
 from typing import Any, Dict, List, Tuple, Optional
+from datetime import datetime, timedelta
 
 import pandas as pd
 
@@ -339,6 +340,21 @@ def append_new_row(spreadsheet_id: str, range_name: str, new_row_dict: Dict[str,
     - history_range: optional history sheet range/name to sync headers from prior to append.
     - Returns a dict with status and the appended row number when available.
     """
+    # helpers for number/date detection & excel serial conversion
+    def _is_number_like(x):
+        if isinstance(x, (int, float)):
+            return True
+        if isinstance(x, str):
+            s = x.strip()
+            return bool(re.match(r"^\d+(\.\d+)?$", s))
+        return False
+
+    def _to_datetime_if_excel_serial(val_float: float) -> datetime:
+        # Excel serial date to python datetime:
+        # using epoch 1899-12-30 handles Excel serial numbers cross-platform (common approach)
+        excel_epoch = datetime(1899, 12, 30)
+        return excel_epoch + timedelta(days=val_float)
+
     service = _get_write_service(creds_info, creds_file)
     sheet = service.spreadsheets()
 
@@ -394,49 +410,93 @@ def append_new_row(spreadsheet_id: str, range_name: str, new_row_dict: Dict[str,
 
     # Build row in header order (case-insensitive matching)
     row_out: List[Any] = []
+
+    # case-insensitive key map for new_row_dict
+    key_map = {k.lower(): k for k in new_row_dict.keys()}
+
     for col in header:
+        # find value case-insensitively
+        v = None
         if col in new_row_dict:
             v = new_row_dict[col]
         else:
-            # case-insensitive fallback
-            found = None
-            for k in new_row_dict:
-                if k.lower() == col.lower():
-                    found = new_row_dict[k]
-                    break
-            v = found if found is not None else None
+            lookup = key_map.get(col.lower())
+            if lookup is not None:
+                v = new_row_dict.get(lookup)
+            else:
+                v = None
 
+        # default for is_deleted
         if str(col).lower() == "is_deleted" and (v is None):
             v = "false"
 
-        # Convert datetimes/pandas types to strings for Sheets
+        # Normalize / convert values
         if v is None:
             row_out.append(None)
-        else:
-            try:
-                import pandas as _pd
-                if isinstance(v, (_pd.Timestamp,)):
-                    try:
-                        row_out.append(v.to_pydatetime().strftime("%Y-%m-%d %H:%M:%S"))
-                    except Exception:
-                        row_out.append(str(v))
-                    continue
-            except Exception:
-                pass
-            try:
-                from datetime import datetime, date
-                if isinstance(v, (datetime, date)):
-                    try:
-                        if isinstance(v, date) and not isinstance(v, datetime):
-                            row_out.append(v.isoformat())
-                        else:
-                            row_out.append(v.strftime("%Y-%m-%d %H:%M:%S"))
-                    except Exception:
+            continue
+
+        # pandas Timestamp -> python datetime
+        try:
+            import pandas as _pd
+            if isinstance(v, (_pd.Timestamp,)):
+                try:
+                    row_out.append(v.to_pydatetime().strftime("%Y-%m-%d %H:%M:%S"))
+                except Exception:
+                    row_out.append(str(v))
+                continue
+        except Exception:
+            pass
+
+        # python datetime / date
+        try:
+            from datetime import datetime as _dt, date as _date
+            if isinstance(v, (_dt, _date)):
+                try:
+                    if isinstance(v, _date) and not isinstance(v, _dt):
                         row_out.append(v.isoformat())
-                    continue
+                    else:
+                        row_out.append(v.strftime("%Y-%m-%d %H:%M:%S"))
+                except Exception:
+                    row_out.append(v.isoformat())
+                continue
+        except Exception:
+            pass
+
+        # Detect date-like columns
+        col_lower = str(col).lower()
+        is_date_like_column = ("date" in col_lower) or ("time" in col_lower) or (col_lower in ("timestamp", "datetime"))
+
+        # Numeric or numeric-string -> possibly Excel serial for date-like columns
+        if _is_number_like(v) and is_date_like_column:
+            try:
+                val_float = float(v)
+                # Heuristic: convert any numeric in date-like column using Excel serial epoch
+                dt = _to_datetime_if_excel_serial(val_float)
+                row_out.append(dt.strftime("%Y-%m-%d %H:%M:%S"))
+                continue
             except Exception:
+                # fallback to next handling
                 pass
+
+        # If numeric and not date-like, preserve numeric
+        if isinstance(v, (int, float)):
             row_out.append(v)
+            continue
+
+        # Strings -> strip and keep
+        if isinstance(v, str):
+            s = v.strip()
+            row_out.append(s)
+            continue
+
+        # Fallback: attempt isoformat or str()
+        try:
+            if hasattr(v, "isoformat"):
+                row_out.append(v.isoformat())
+            else:
+                row_out.append(str(v))
+        except Exception:
+            row_out.append("")
 
     try:
         append_res = sheet.values().append(
