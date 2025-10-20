@@ -83,7 +83,7 @@ def main():
         df["_source_sheet"] = source_name
         return df
 
-    # Reduce cache TTL while debugging appends so refresh picks up new rows quickly.
+    # Reduced cache TTL to allow quick refreshes while testing appends.
     @st.cache_data(ttl=3, show_spinner=False)
     def fetch_sheets(spreadsheet_id, range_hist, range_append, creds_info, reload_key):
         hist_df = _read_sheet_with_index(spreadsheet_id, range_hist, "history", creds_info)
@@ -146,7 +146,11 @@ def main():
     # ------------------ Sidebar Filters ------------------
     st.sidebar.header("Filters")
 
-    # Month filter (NEW)
+    # Bank filter moved to sidebar
+    banks = sorted(converted_df["Bank"].dropna().unique().tolist())
+    sel_banks = st.sidebar.multiselect("Banks", options=banks, default=banks, key="bank_filter_sidebar")
+
+    # Month filter (in sidebar)
     ts_valid = converted_df["timestamp"].dropna()
     if not ts_valid.empty:
         months = sorted(ts_valid.dt.to_period("M").astype(str).unique(), reverse=True)
@@ -156,25 +160,9 @@ def main():
     sel_month = st.sidebar.selectbox("Month", options=month_options, index=0,
                                      help="Select a calendar month to restrict the charts and totals to that month (or choose All).")
 
-    # ------------------ Main: Bank Filter (with chips) ------------------
-    st.markdown("### Filter by Bank")
-    banks = sorted(converted_df["Bank"].dropna().unique().tolist())
-    sel_banks = st.multiselect("Banks", options=banks, default=banks, key="bank_filter_main")
-
-    # Render visual chips for selected banks (non-interactive — use multiselect to change)
-    if sel_banks:
-        chip_html = "<div style='display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px;'>"
-        for b in sel_banks:
-            chip_html += f"<span style='display:inline-block; background-color:#ff5b57; color:white; padding:8px 12px; border-radius:8px; font-weight:600;'>{b} &nbsp; <span style='opacity:0.9;'>✕</span></span>"
-        chip_html += "</div>"
-        st.markdown(chip_html, unsafe_allow_html=True)
-    else:
-        st.markdown("<div style='color:#666; margin-bottom:10px;'>No banks selected — showing nothing until you select banks.</div>", unsafe_allow_html=True)
-
-    # Apply bank filter
+    # ------------------ Apply Filters ------------------
     filtered_df = converted_df[converted_df["Bank"].isin(sel_banks)].copy()
 
-    # Apply month filter (if chosen)
     if sel_month != "All" and sel_month:
         try:
             y, m = sel_month.split("-")
@@ -183,29 +171,6 @@ def main():
             filtered_df = filtered_df.loc[mask_month].copy()
         except Exception:
             pass
-
-    # ------------------ Debug: Raw sheets explorer (expander) ------------------
-    with st.expander("Raw Sheets (debug) — last rows (useful to confirm manual appends are read)"):
-        st.write("History sheet (tail):")
-        try:
-            st.dataframe(history_df.tail(10))
-        except Exception:
-            st.write("No history data.")
-        st.write("Append sheet (tail):")
-        try:
-            st.dataframe(append_df.tail(20))
-        except Exception:
-            st.write("No append data.")
-        st.write("Combined raw (df_raw) tail:")
-        try:
-            st.dataframe(df_raw.tail(20))
-        except Exception:
-            st.write("No combined raw.")
-        st.write("Converted (after transform) tail:")
-        try:
-            st.dataframe(converted_df.tail(20))
-        except Exception:
-            st.write("No converted data.")
 
     # ------------------ Compute totals and charts ------------------
     with st.spinner("Computing daily totals..."):
@@ -445,18 +410,7 @@ def main():
                             history_range=RANGE,
                         )
 
-                        # show the append response to help debug and verify row written
-                        st.write("Append response:", res)
-                        # show updatedRange if present
-                        try:
-                            ur = res.get("append_response", {}).get("updates", {}).get("updatedRange") or res.get("append_response", {}).get("updatedRange")
-                            if ur:
-                                st.info(f"API appended to: {ur}")
-                            elif res.get("appended_row_number"):
-                                st.info(f"Appended to row number: {res['appended_row_number']}")
-                        except Exception:
-                            pass
-
+                        # Do not show debug append response here (removed per request).
                         if res.get("status") == "ok":
                             st.success("✅ Row added successfully with correct date format!")
                             st.session_state.reload_key += 1
