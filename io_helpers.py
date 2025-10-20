@@ -155,6 +155,15 @@ def _normalize_range_for_get(range_name: Optional[str]) -> Optional[str]:
     return range_name
 
 
+def _sheet_name_from_range(range_name: str) -> str:
+    """Return just the sheet/tab name portion of a range (before '!')"""
+    if not range_name:
+        return ""
+    if '!' in range_name:
+        return range_name.split('!')[0]
+    return range_name
+
+
 def read_google_sheet(spreadsheet_id: str, range_name: str,
                       creds_info: Optional[Dict] = None, creds_file: Optional[str] = None) -> pd.DataFrame:
     """
@@ -168,24 +177,59 @@ def read_google_sheet(spreadsheet_id: str, range_name: str,
     The returned DataFrame will have normalized column names and, if an is_deleted column
     exists, it will be canonicalized to 'TRUE'/'FALSE' strings stored in the 'is_deleted' column.
     """
-    # Normalize simple sheet/tab names to a wide A1 range to ensure new manual rows are captured.
-    range_name = _normalize_range_for_get(range_name)
-
     if creds_info is None and (creds_file is None or not os.path.exists(creds_file)):
         raise ValueError("No credentials found. Provide creds_info (plain dict) or a valid creds_file path.")
 
+    # Build service
     if creds_info is not None:
         service = build_sheets_service_from_info(creds_info)
     else:
         service = build_sheets_service_from_file(creds_file)
 
+    # Candidate ranges to try (best-effort to catch manual appends that sometimes fall outside trimmed rect)
+    tried_ranges = []
+    norm = _normalize_range_for_get(range_name)
+    candidate_ranges = [norm] if norm else []
+    # If normalized range doesn't include an explicit row number, also try a large explicit row range
     try:
-        sheet = service.spreadsheets()
-        res = sheet.values().get(spreadsheetId=spreadsheet_id, range=range_name).execute()
-        values = res.get("values", [])
-    except HttpError as e:
-        raise RuntimeError(f"Google Sheets API error: {e}")
+        sheet_name = _sheet_name_from_range(range_name)
+        # large explicit fallback to include many rows (safe but limited so not unbounded)
+        if sheet_name:
+            large_range = f"{sheet_name}!A1:AZ10000"
+            if large_range not in candidate_ranges:
+                candidate_ranges.append(large_range)
+            # also ensure the simpler A:AZ form is included (if not already)
+            a_az = f"{sheet_name}!A:AZ"
+            if a_az not in candidate_ranges:
+                candidate_ranges.append(a_az)
+    except Exception:
+        # ignore sheet_name failures; we'll just try the normalized range
+        pass
 
+    values = []
+    last_err = None
+    for r in candidate_ranges:
+        if not r:
+            continue
+        tried_ranges.append(r)
+        try:
+            sheet = service.spreadsheets()
+            res = sheet.values().get(spreadsheetId=spreadsheet_id, range=r).execute()
+            values = res.get("values", []) or []
+            # If we got values that look usable (non-empty or header present) accept it
+            if values and len(values) > 0:
+                break
+            # If no values, continue to next candidate range
+        except HttpError as e:
+            last_err = e
+            # try next candidate range
+            continue
+
+    if not values and last_err is not None:
+        # If none worked and there was an HttpError, raise a helpful message
+        raise RuntimeError(f"Google Sheets API error reading ranges {tried_ranges}: {last_err}")
+
+    # Convert into DataFrame
     df = values_to_dataframe(values)
     df = _normalize_is_deleted_column(df)
     return df
