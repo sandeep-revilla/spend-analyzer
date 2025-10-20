@@ -382,44 +382,16 @@ def main():
                         st.session_state.reload_key += 1
                         st.experimental_rerun()
 
-    # ------------------ Add New Row (✅ FIXED DATE FORMAT + EXCEL-SERIAL INPUT) ------------------
+    # ------------------ Add New Row (date picker only) ------------------
     st.markdown("---")
     st.write("➕ Add a new transaction")
 
-    # helper to parse UI input for DateTime (accepts date picker, free-text datetime, or excel serial)
-    def parse_input_datetime(date_picker_value: date, free_text: str) -> str:
+    # helper to parse UI input for DateTime (uses only the date picker, combined with current UTC time)
+    def parse_input_datetime(date_picker_value: date) -> str:
         """
-        Returns a timestamp string in 'YYYY-MM-DD HH:MM:SS' format.
-        - If free_text is numeric (Excel serial), convert it.
-        - If free_text looks like an ISO datetime, try to parse it.
-        - Otherwise, fallback to combining date_picker_value with current UTC time.
+        Returns a timestamp string in 'YYYY-MM-DD HH:MM:SS' format
+        by combining the chosen date with the current UTC time.
         """
-        s = (free_text or "").strip()
-        if s:
-            if re.match(r"^\d+(\.\d+)?$", s):
-                try:
-                    val = float(s)
-                    excel_epoch = datetime(1899, 12, 30)
-                    dt = excel_epoch + timedelta(days=val)
-                    return dt.strftime("%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    pass
-            try:
-                dt = datetime.fromisoformat(s)
-                if dt.time() == dt_time(0, 0):
-                    dt = datetime.combine(dt.date(), datetime.utcnow().time())
-                return dt.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                pass
-            common_formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d-%m-%Y %H:%M:%S", "%d-%m-%Y"]
-            for fmt in common_formats:
-                try:
-                    dt = datetime.strptime(s, fmt)
-                    if "%H" not in fmt:
-                        dt = datetime.combine(dt.date(), datetime.utcnow().time())
-                    return dt.strftime("%Y-%m-%d %H:%M:%S")
-                except Exception:
-                    continue
         dt_combined = datetime.combine(date_picker_value, datetime.utcnow().time())
         return dt_combined.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -427,7 +399,6 @@ def main():
         with st.expander("Add new row"):
             with st.form("add_row_form", clear_on_submit=True):
                 new_date = st.date_input("Date (picker)", value=datetime.utcnow().date())
-                free_dt = st.text_input("Optional: enter full datetime or Excel serial (e.g. 45950.16729)", "")
                 bank = st.text_input("Bank", "HDFC Bank")
                 txn_type = st.selectbox("Type", ["debit", "credit"])
                 amount = st.number_input("Amount (₹)", min_value=0.0, step=1.0, format="%.2f")
@@ -436,7 +407,7 @@ def main():
 
                 if submit_add:
                     try:
-                        timestamp_str = parse_input_datetime(new_date, free_dt)
+                        timestamp_str = parse_input_datetime(new_date)
 
                         new_row = {
                             "DateTime": timestamp_str,  # Sheets will recognize this as a date
