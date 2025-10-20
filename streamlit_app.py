@@ -133,14 +133,47 @@ def main():
         st.text(traceback.format_exc())
         return
 
+    # Ensure timestamp column is parsed early so we can compute month options
+    if "timestamp" in converted_df.columns:
+        converted_df["timestamp"] = pd.to_datetime(converted_df["timestamp"], errors="coerce")
+    else:
+        converted_df["timestamp"] = pd.to_datetime(converted_df.get("date"), errors="coerce")
+
     if "Bank" not in converted_df.columns:
         converted_df["Bank"] = "Unknown"
 
     # ------------------ Sidebar Filters ------------------
     st.sidebar.header("Filters")
+
+    # Bank filter (existing)
     banks = sorted(converted_df["Bank"].dropna().unique().tolist())
     sel_banks = st.sidebar.multiselect("Banks", options=banks, default=banks)
-    filtered_df = converted_df[converted_df["Bank"].isin(sel_banks)]
+
+    # Month filter (NEW)
+    # Build month options from converted_df timestamps
+    ts_valid = converted_df["timestamp"].dropna()
+    if not ts_valid.empty:
+        # months in YYYY-MM format; sort descending (most recent first)
+        months = sorted(ts_valid.dt.to_period("M").astype(str).unique(), reverse=True)
+    else:
+        months = []
+    month_options = ["All"] + months
+    sel_month = st.sidebar.selectbox("Month", options=month_options, index=0, help="Select a calendar month to restrict the charts and totals to that month (or choose All).")
+
+    # Apply bank filter first
+    filtered_df = converted_df[converted_df["Bank"].isin(sel_banks)].copy()
+
+    # Apply month filter (if chosen)
+    if sel_month != "All" and sel_month:
+        try:
+            # sel_month format is "YYYY-MM"
+            y, m = sel_month.split("-")
+            y = int(y); m = int(m)
+            mask_month = (filtered_df["timestamp"].dt.year == y) & (filtered_df["timestamp"].dt.month == m)
+            filtered_df = filtered_df.loc[mask_month].copy()
+        except Exception:
+            # If parsing fails, do not filter
+            pass
 
     with st.spinner("Computing daily totals..."):
         try:
@@ -155,10 +188,12 @@ def main():
         merged["Date"] = pd.to_datetime(merged["Date"]).dt.normalize()
 
     # ------------------ Date Range ------------------
-    if "timestamp" in filtered_df.columns:
-        filtered_df["timestamp"] = pd.to_datetime(filtered_df["timestamp"], errors="coerce")
-    else:
+    # Note: filtered_df already has timestamp parsed above, so reuse it.
+    if "timestamp" not in filtered_df.columns:
         filtered_df["timestamp"] = pd.to_datetime(filtered_df.get("date"), errors="coerce")
+    else:
+        # ensure timestamp column is datetime type
+        filtered_df["timestamp"] = pd.to_datetime(filtered_df["timestamp"], errors="coerce")
 
     valid_dates = filtered_df["timestamp"].dropna()
     if valid_dates.empty:
@@ -234,6 +269,7 @@ def main():
             series_selected.append("Total_Credit")
         top_n = st.sidebar.slider("Top-N categories", 3, 20, 5)
         try:
+            # charts_mod.render_chart expects merged and filtered_df; pass already-month-filtered versions
             charts_mod.render_chart(merged, filtered_df, chart_type, series_selected, top_n=top_n, height=420)
         except Exception as e:
             st.error("Chart rendering failed. See traceback below.")
@@ -308,15 +344,14 @@ def main():
                         selected_keys.append(k)
                         break
 
-            # Confirmation: require checkbox or typed 'DELETE' to prevent accidental removal
+            # Confirmation: require checkbox to prevent accidental removal (typed DELETE removed)
             confirm = st.checkbox("I confirm I want to mark the selected rows as deleted")
-            typed = st.text_input("Type DELETE to confirm (optional extra safeguard)", "")
 
             if st.button("Mark selected rows deleted"):
                 if not selected_keys:
                     st.warning("No rows selected to remove.")
-                elif not confirm and typed.strip().upper() != "DELETE":
-                    st.warning("Please confirm deletion by checking the box or typing DELETE.")
+                elif not confirm:
+                    st.warning("Please confirm deletion by checking the box.")
                 else:
                     # Group by source and call mark_rows_deleted for each sheet separately
                     grouped = {}
