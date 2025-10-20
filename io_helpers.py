@@ -145,13 +145,13 @@ def _normalize_range_for_get(range_name: Optional[str]) -> Optional[str]:
     doesn't return a trimmed rect missing newly added rows/columns.
 
     If range_name is None or already contains an A1 range ('!' or ':'), return as-is.
-    Otherwise convert 'SheetName' -> 'SheetName!A:Z'. Adjust columns if you need wider coverage.
+    Otherwise convert 'SheetName' -> 'SheetName!A:AZ'. Adjust columns if you need wider coverage.
     """
     if not range_name:
         return range_name
     if isinstance(range_name, str) and ('!' not in range_name) and (':' not in range_name):
-        # Use A:Z by default; change to A:AZ or A:ZZ if your sheet has more than 26 columns.
-        return f"{range_name}!A:Z"
+        # Use A:AZ by default to cover more columns so manual rows are not trimmed.
+        return f"{range_name}!A:AZ"
     return range_name
 
 
