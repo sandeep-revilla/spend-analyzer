@@ -140,6 +140,21 @@ def build_sheets_service_write_from_file(creds_file: str):
     return build("sheets", "v4", credentials=creds, cache_discovery=False)
 
 
+def _normalize_range_for_get(range_name: Optional[str]) -> Optional[str]:
+    """Normalize a simple sheet/tab name to a wide A1 range so the Sheets API
+    doesn't return a trimmed rect missing newly added rows/columns.
+
+    If range_name is None or already contains an A1 range ('!' or ':'), return as-is.
+    Otherwise convert 'SheetName' -> 'SheetName!A:Z'. Adjust columns if you need wider coverage.
+    """
+    if not range_name:
+        return range_name
+    if isinstance(range_name, str) and ('!' not in range_name) and (':' not in range_name):
+        # Use A:Z by default; change to A:AZ or A:ZZ if your sheet has more than 26 columns.
+        return f"{range_name}!A:Z"
+    return range_name
+
+
 def read_google_sheet(spreadsheet_id: str, range_name: str,
                       creds_info: Optional[Dict] = None, creds_file: Optional[str] = None) -> pd.DataFrame:
     """
@@ -153,6 +168,9 @@ def read_google_sheet(spreadsheet_id: str, range_name: str,
     The returned DataFrame will have normalized column names and, if an is_deleted column
     exists, it will be canonicalized to 'TRUE'/'FALSE' strings stored in the 'is_deleted' column.
     """
+    # Normalize simple sheet/tab names to a wide A1 range to ensure new manual rows are captured.
+    range_name = _normalize_range_for_get(range_name)
+
     if creds_info is None and (creds_file is None or not os.path.exists(creds_file)):
         raise ValueError("No credentials found. Provide creds_info (plain dict) or a valid creds_file path.")
 
@@ -203,6 +221,10 @@ def ensure_sheet_headers_match(spreadsheet_id: str,
     - If history_range is None, this becomes a no-op (returns ok).
     Returns dict {status: 'ok'|'error', 'added': [cols], 'message': str}
     """
+    # Normalize simple sheet/tab names to wide A1 ranges to ensure API returns newly-added rows.
+    history_range = _normalize_range_for_get(history_range)
+    append_range = _normalize_range_for_get(append_range)
+
     service = _get_write_service(creds_info, creds_file)
     sheet = service.spreadsheets()
 
@@ -281,6 +303,9 @@ def mark_rows_deleted(spreadsheet_id: str, range_name: str,
 
     Returns: dict with status and count of rows updated.
     """
+    # Normalize simple sheet/tab names to a wide A1 range for reading/writing.
+    range_name = _normalize_range_for_get(range_name)
+
     if not row_indices:
         return {"status": "no-op", "updated": 0, "message": "No row indices provided."}
 
@@ -340,6 +365,10 @@ def append_new_row(spreadsheet_id: str, range_name: str, new_row_dict: Dict[str,
     - history_range: optional history sheet range/name to sync headers from prior to append.
     - Returns a dict with status and the appended row number when available.
     """
+    # Normalize simple sheet/tab names to a wide A1 range for reading/writing.
+    range_name = _normalize_range_for_get(range_name)
+    history_range = _normalize_range_for_get(history_range)
+
     # helpers for number/date detection & excel serial conversion
     def _is_number_like(x):
         if isinstance(x, (int, float)):
