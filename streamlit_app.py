@@ -229,11 +229,8 @@ def main():
     # Totals mode radio (move to sidebar, keep earlier behavior)
     totals_mode = st.sidebar.radio("Totals mode", ["Single date", "Date range"], index=0)
 
-    # ------------------ Apply Filters ------------------
+    # ------------------ Apply Filters ------------------ 
     filtered_df = converted_df[converted_df["Bank"].isin(sel_banks)].copy()
-
-    # Note: chart / table filters use sel_banks and will still filter by month-range as before when applying start/end date windows.
-    # (Monthly average is controlled by separate Year/Month selectors above.)
 
     # ------------------ Compute filtered daily totals used for charts ------------------
     with st.spinner("Computing daily totals..."):
@@ -367,16 +364,15 @@ def main():
         except Exception:
             metric_avg = prev_avg = None
 
-    # ------------------ Top-right compact metric (moved here with correct formatting) ------------------
+    # ------------------ Top-right compact metric (dynamic title like "oct AVG spent") ------------------
     top_left, top_mid, top_right = st.columns([6, 2, 2])
     with top_right:
-        # New, corrected title and display (moved from bottom)
-        title_small = "Monthly average (Selected metric month)"
-        # month label like "Sep-25"
+        # month label like "Sep-25" -> we will use abbreviated month for title
         if metric_year and metric_month:
-            month_label = pd.Timestamp(metric_year, metric_month, 1).strftime("%b-%y")
+            month_label_abbr = pd.Timestamp(metric_year, metric_month, 1).strftime("%b")  # e.g., "Oct"
+            title_small = f"{month_label_abbr.lower()} AVG spent"  # e.g., "oct AVG spent"
         else:
-            month_label = "—"
+            title_small = "AVG spent"
 
         if metric_avg is None:
             metric_text = "N/A"
@@ -393,7 +389,6 @@ def main():
                     pct = (diff / abs(prev_avg)) * 100.0
                     delta_label = f"{pct:+.1f}%"
                 else:
-                    # when previous is zero or nearly zero, show absolute diff with sign
                     delta_label = f"{diff:+.2f}"
             except Exception:
                 delta_label = f"{diff:+.2f}"
@@ -410,11 +405,16 @@ def main():
 
             delta_html = f"<div style='text-align:right; color:{color}; font-weight:700'>{arrow} {delta_label}</div>"
 
-        # Render: month label (small), amount (big), delta (colored)
+        # Render: dynamic small title, month label (for clarity), amount (big), delta (colored)
+        if metric_year and metric_month:
+            month_label_display = pd.Timestamp(metric_year, metric_month, 1).strftime("%b-%y")
+        else:
+            month_label_display = "—"
+
         st.markdown(
             "<div style='text-align:right'>"
             f"<div style='font-size:12px;color:#666'>{title_small}</div>"
-            f"<div style='font-size:14px;color:#444'>{month_label}</div>"
+            f"<div style='font-size:14px;color:#444'>{month_label_display}</div>"
             f"<div style='font-size:20px;font-weight:800'>{metric_text}</div>"
             f"{delta_html}"
             "</div>",
@@ -529,7 +529,7 @@ def main():
                         st.session_state.reload_key += 1
                         st.experimental_rerun()
 
-    # ------------------ Add New Row (date picker only, choose bank from data or Other) ------------------
+    # ------------------ Add New Row (date picker only, choose bank from data or manual checkbox) ------------------
     st.markdown("---")
     st.write("➕ Add a new transaction")
 
@@ -551,19 +551,19 @@ def main():
         with st.expander("Add new row"):
             with st.form("add_row_form", clear_on_submit=True):
                 new_date = st.date_input("Date (picker)", value=datetime.utcnow().date())
-                # Bank selection: pick from session_state bank list OR enter manual value
+                # Bank selection: pick from session_state bank list OR enter manual value (via checkbox)
                 add_bank_options = st.session_state["bank_options"].copy() if st.session_state.get("bank_options") else ["Unknown"]
                 add_bank_options = sorted(list(set(add_bank_options)))
-                if "Other (enter below)" not in add_bank_options:
-                    add_bank_options.append("Other (enter below)")
+                # DO NOT append "Other (enter below)" anymore — manual entry is handled by a checkbox below
 
                 # Selectbox for bank
                 chosen_bank_sel = st.selectbox("Bank", options=add_bank_options, index=0, key="add_bank_select")
 
-                # Only show the custom bank input when Other is selected (fix for "can't enter new bank")
+                # Checkbox to enable manual bank entry
+                manual_bank = st.checkbox("Add new bank manually", value=False, key="add_bank_manual")
                 bank_other = ""
-                if chosen_bank_sel == "Other (enter below)":
-                    bank_other = st.text_input("Bank (custom) — used when 'Other (enter below)' selected", value="", key="add_bank_other")
+                if manual_bank:
+                    bank_other = st.text_input("Enter bank name", value="", key="add_bank_other")
 
                 txn_type = st.selectbox("Type", ["debit", "credit"])
                 amount = st.number_input("Amount (₹)", min_value=0.0, step=1.0, format="%.2f")
@@ -572,8 +572,8 @@ def main():
 
                 if submit_add:
                     try:
-                        # choose bank value (manual override if Other selected)
-                        if chosen_bank_sel == "Other (enter below)":
+                        # choose bank value: manual if checkbox checked, otherwise dropdown value
+                        if manual_bank:
                             chosen_bank = bank_other.strip() if bank_other and bank_other.strip() else "Unknown"
                         else:
                             chosen_bank = chosen_bank_sel if chosen_bank_sel else "Unknown"
@@ -597,7 +597,7 @@ def main():
                         # Validate required fields minimally
                         if chosen_bank == "Unknown":
                             # let it still append if user explicitly chose Unknown, but prefer to prompt
-                            st.info("Bank will be recorded as 'Unknown'. If you meant to add a custom name, fill the custom bank field and submit again.")
+                            st.info("Bank will be recorded as 'Unknown'. If you meant to add a custom name, check the 'Add new bank manually' box and submit again.")
                         res = io_mod.append_new_row(
                             spreadsheet_id=SHEET_ID,
                             range_name=APPEND_RANGE,
@@ -631,9 +631,6 @@ def main():
     c1.metric("Credits", f"₹{credit_sum:,.0f}", f"{credit_count} txns")
     c2.metric("Debits", f"₹{debit_sum:,.0f}", f"{debit_count} txns")
     c3.metric("Net (Credits − Debits)", f"₹{(credit_sum - debit_sum):,.0f}")
-
-    # Note: the detailed monthly-average block was intentionally moved up to the top-right area.
-    # The bottom copy has been removed to avoid duplication.
 
 if __name__ == "__main__":
     try:
