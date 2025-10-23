@@ -367,16 +367,59 @@ def main():
         except Exception:
             metric_avg = prev_avg = None
 
-    # ------------------ Top-right compact metric (small title as requested) ------------------
+    # ------------------ Top-right compact metric (moved here with correct formatting) ------------------
     top_left, top_mid, top_right = st.columns([6, 2, 2])
     with top_right:
-        title_small = "mont avg apent"  # exact label requested
-        if metric_avg is None:
-            display_val = "N/A"
+        # New, corrected title and display (moved from bottom)
+        title_small = "Monthly average (Selected metric month)"
+        # month label like "Sep-25"
+        if metric_year and metric_month:
+            month_label = pd.Timestamp(metric_year, metric_month, 1).strftime("%b-%y")
         else:
-            display_val = f"₹{metric_avg:,.2f}"
-        st.markdown(f"<div style='text-align:right; font-size:12px; color:#444'>{title_small}</div>", unsafe_allow_html=True)
-        st.markdown(f"<div style='text-align:right; font-size:18px; font-weight:700'>{display_val}</div>", unsafe_allow_html=True)
+            month_label = "—"
+
+        if metric_avg is None:
+            metric_text = "N/A"
+        else:
+            metric_text = f"₹{metric_avg:,.2f}"
+
+        # delta calculation
+        if prev_avg is None or metric_avg is None:
+            delta_html = f"<div style='text-align:right; color:gray; font-weight:600'>N/A</div>"
+        else:
+            diff = metric_avg - prev_avg
+            try:
+                if abs(prev_avg) > 1e-9:
+                    pct = (diff / abs(prev_avg)) * 100.0
+                    delta_label = f"{pct:+.1f}%"
+                else:
+                    # when previous is zero or nearly zero, show absolute diff with sign
+                    delta_label = f"{diff:+.2f}"
+            except Exception:
+                delta_label = f"{diff:+.2f}"
+
+            if diff > 0:
+                color = "red"
+                arrow = "▲"
+            elif diff < 0:
+                color = "green"
+                arrow = "▼"
+            else:
+                color = "gray"
+                arrow = "►"
+
+            delta_html = f"<div style='text-align:right; color:{color}; font-weight:700'>{arrow} {delta_label}</div>"
+
+        # Render: month label (small), amount (big), delta (colored)
+        st.markdown(
+            "<div style='text-align:right'>"
+            f"<div style='font-size:12px;color:#666'>{title_small}</div>"
+            f"<div style='font-size:14px;color:#444'>{month_label}</div>"
+            f"<div style='font-size:20px;font-weight:800'>{metric_text}</div>"
+            f"{delta_html}"
+            "</div>",
+            unsafe_allow_html=True,
+        )
 
     # ------------------ Charts ------------------
     st.subheader("📊 Charts")
@@ -513,9 +556,15 @@ def main():
                 add_bank_options = sorted(list(set(add_bank_options)))
                 if "Other (enter below)" not in add_bank_options:
                     add_bank_options.append("Other (enter below)")
+
+                # Selectbox for bank
                 chosen_bank_sel = st.selectbox("Bank", options=add_bank_options, index=0, key="add_bank_select")
-                # Always show the custom bank text input (more discoverable); enable/disable based on selectbox
-                bank_other = st.text_input("Bank (custom) — used when 'Other (enter below)' selected", value="", key="add_bank_other")
+
+                # Only show the custom bank input when Other is selected (fix for "can't enter new bank")
+                bank_other = ""
+                if chosen_bank_sel == "Other (enter below)":
+                    bank_other = st.text_input("Bank (custom) — used when 'Other (enter below)' selected", value="", key="add_bank_other")
+
                 txn_type = st.selectbox("Type", ["debit", "credit"])
                 amount = st.number_input("Amount (₹)", min_value=0.0, step=1.0, format="%.2f")
                 msg = st.text_input("Message / Description", "")
@@ -583,54 +632,8 @@ def main():
     c2.metric("Debits", f"₹{debit_sum:,.0f}", f"{debit_count} txns")
     c3.metric("Net (Credits − Debits)", f"₹{(credit_sum - debit_sum):,.0f}")
 
-    # ------------------ Metric (Average) display also at bottom (detailed with delta) ------------------
-    st.markdown("---")
-    st.subheader("Monthly average (Selected metric month)")
-    col1, col2 = st.columns([3, 1])
-    with col2:
-        if metric_year and metric_month:
-            label = pd.Timestamp(metric_year, metric_month, 1).strftime("%b-%y")
-        else:
-            label = "—"
-        if metric_avg is None:
-            metric_text = "N/A"
-        else:
-            metric_text = f"₹{metric_avg:,.2f}"
-        # delta
-        if prev_avg is None or metric_avg is None:
-            delta_html = f"<span style='color:gray'>N/A</span>"
-        else:
-            diff = metric_avg - prev_avg
-            try:
-                if abs(prev_avg) > 1e-9:
-                    pct = (diff / abs(prev_avg)) * 100.0
-                    delta_label = f"{pct:+.1f}%"
-                else:
-                    delta_label = f"{diff:+.2f}"
-            except Exception:
-                delta_label = f"{diff:+.2f}"
-
-            if diff > 0:
-                color = "red"
-                arrow = "▲"
-            elif diff < 0:
-                color = "green"
-                arrow = "▼"
-            else:
-                color = "gray"
-                arrow = "►"
-
-            delta_html = f"<span style='color:{color}; font-weight:600'>{arrow} {delta_label}</span>"
-
-        st.markdown(
-            f"<div style='text-align:right'>"
-            f"<div style='font-size:12px;color:#666'>{label}</div>"
-            f"<div style='font-size:20px;font-weight:700'>{metric_text}</div>"
-            f"<div>{delta_html}</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
+    # Note: the detailed monthly-average block was intentionally moved up to the top-right area.
+    # The bottom copy has been removed to avoid duplication.
 
 if __name__ == "__main__":
     try:
