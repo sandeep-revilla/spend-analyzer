@@ -54,6 +54,10 @@ def main():
     if "last_refreshed" not in st.session_state:
         st.session_state.last_refreshed = None
 
+    # We'll keep an in-memory bank list so we can add new banks immediately after append
+    if "bank_options" not in st.session_state:
+        st.session_state["bank_options"] = None
+
     # ------------------ Helpers ------------------
     def _get_creds_info():
         if io_mod is None:
@@ -90,7 +94,7 @@ def main():
         app_df = _read_sheet_with_index(spreadsheet_id, range_append, "append", creds_info)
         return hist_df, app_df
 
-    # ------------------ Sidebar: Refresh (green) + Filters ------------------
+    # ------------------ Sidebar: Refresh (green) + Controls ------------------
     st.sidebar.header("Controls")
 
     # Green refresh button in sidebar (best-effort styling)
@@ -159,7 +163,7 @@ def main():
     except Exception:
         pass
 
-    # Ensure timestamp column is parsed early so we can compute month options
+    # Ensure timestamp column is parsed early so we can compute month / year options
     if "timestamp" in converted_df.columns:
         converted_df["timestamp"] = pd.to_datetime(converted_df["timestamp"], errors="coerce")
     else:
@@ -179,21 +183,32 @@ def main():
     # ------------------ Sidebar Filters ------------------
     st.sidebar.header("Filters")
 
-    # Bank filter computed dynamically from data (not static)
+    # Bank filter computed dynamically from data
     banks = sorted([b for b in converted_df["Bank"].dropna().unique().tolist()])
     if not banks:
         banks = ["Unknown"]
-    sel_banks = st.sidebar.multiselect("Banks", options=banks, default=banks, key="bank_filter_sidebar")
 
-    # Month filter (in sidebar) - used both for charts & metric selection
-    ts_valid = converted_df["timestamp"].dropna()
-    if not ts_valid.empty:
-        months = sorted(ts_valid.dt.to_period("M").astype(str).unique().tolist(), reverse=True)
+    # initialize session_state bank_options if not set
+    if st.session_state.get("bank_options") is None:
+        st.session_state["bank_options"] = banks.copy()
     else:
-        months = []
-    month_options = ["All"] + months
-    sel_month = st.sidebar.selectbox("Month", options=month_options, index=0,
-                                     help="Select a calendar month to restrict the charts and totals to that month (or choose All).")
+        # ensure session state contains all banks present in data (in case history had banks not present earlier)
+        for b in banks:
+            if b not in st.session_state["bank_options"]:
+                st.session_state["bank_options"].append(b)
+        st.session_state["bank_options"] = sorted(list(set(st.session_state["bank_options"])))
+
+    sel_banks = st.sidebar.multiselect("Banks", options=st.session_state["bank_options"], default=st.session_state["bank_options"], key="bank_filter_sidebar")
+
+    # Year & Month filters for monthly average (separate controls)
+    ts_valid = converted_df["timestamp"].dropna()
+    years = sorted(ts_valid.dt.year.unique().tolist(), reverse=True) if not ts_valid.empty else []
+    year_options = ["All"] + [str(y) for y in years]
+    sel_year = st.sidebar.selectbox("Year (for monthly average)", options=year_options, index=0)
+
+    month_map = {i: pd.Timestamp(1900, i, 1).strftime("%B") for i in range(1, 13)}
+    month_options = ["All"] + [month_map[i] for i in range(1, 13)]
+    sel_month_name = st.sidebar.selectbox("Month (for monthly average)", options=month_options, index=0)
 
     # Exclude outliers checkbox (simple text only)
     exclude_outliers = st.sidebar.checkbox("Exclude outliers from average", value=False, key="exclude_outliers")
@@ -214,16 +229,10 @@ def main():
     # ------------------ Apply Filters ------------------
     filtered_df = converted_df[converted_df["Bank"].isin(sel_banks)].copy()
 
-    if sel_month != "All" and sel_month:
-        try:
-            y, m = sel_month.split("-")
-            y = int(y); m = int(m)
-            mask_month = (filtered_df["timestamp"].dt.year == y) & (filtered_df["timestamp"].dt.month == m)
-            filtered_df = filtered_df.loc[mask_month].copy()
-        except Exception:
-            pass
+    # Note: chart / table filters use sel_banks and will still filter by month-range as before when applying start/end date windows.
+    # (Monthly average is controlled by separate Year/Month selectors above.)
 
-    # ------------------ Compute totals and charts (filtered) ------------------
+    # ------------------ Compute filtered daily totals used for charts ------------------
     with st.spinner("Computing daily totals..."):
         try:
             merged = transform.compute_daily_totals(filtered_df)
@@ -236,7 +245,7 @@ def main():
     if not merged.empty:
         merged["Date"] = pd.to_datetime(merged["Date"]).dt.normalize()
 
-    # ------------------ Date Range ------------------
+    # ------------------ Date Range (for rows & totals) ------------------
     if "timestamp" not in filtered_df.columns:
         filtered_df["timestamp"] = pd.to_datetime(filtered_df.get("date"), errors="coerce")
     else:
@@ -276,7 +285,7 @@ def main():
         else:
             start_sel, end_sel = dr, dr
 
-    # ------------------ Compute totals for selected date/range (kept here but UI moved) ------------------
+    # ------------------ Compute totals for selected date/range (for rows & summary metrics) ------------------
     tmp = filtered_df.copy()
     mask = tmp["timestamp"].dt.date.between(start_sel, end_sel)
     sel_df = tmp.loc[mask]
@@ -296,16 +305,14 @@ def main():
             credit_count = int(credit_mask.sum())
             debit_count = int(debit_mask.sum())
 
-    # ------------------ Metric (Average for selected month) ------------------
-    # Use merged_all (unfiltered) for metric computation so filters don't affect the metric.
+    # ------------------ Monthly average metric logic (uses separate Year + Month selectors) ------------------
     def _safe_mean(s):
         s2 = pd.to_numeric(s, errors="coerce").dropna()
         return float(s2.mean()) if not s2.empty else None
 
     def _compute_month_avg_from_merged(merged_df, year, month, replace_outliers=False):
         """
-        Compute average daily Total_Spent for given year/month from merged_df (which is daily totals).
-        If replace_outliers True, use IQR rule to replace outlier daily totals with month median before averaging.
+        same IQR replacement logic as before
         """
         if merged_df is None or merged_df.empty:
             return None, 0, {"reason": "no_data"}
@@ -318,7 +325,6 @@ def main():
         vals = pd.to_numeric(dfm.get("Total_Spent", 0), errors="coerce").fillna(0.0)
         if not replace_outliers or len(vals) < 3:
             return _safe_mean(vals), int(len(vals)), {"outliers_replaced": 0, "n": len(vals)}
-        # IQR detection & replacement
         q1 = vals.quantile(0.25)
         q3 = vals.quantile(0.75)
         iqr = q3 - q1
@@ -331,23 +337,24 @@ def main():
         vals_repl[is_out] = replacement
         return _safe_mean(vals_repl), int(len(vals_repl)), {"outliers_replaced": int(is_out.sum()), "n": len(vals_repl)}
 
-    # Determine metric month/year (use the same sel_month control; if All pick most recent month from merged_all)
-    metric_month = None
+    # Determine which month/year to compute the metric for based on sidebar controls
     metric_year = None
-    if sel_month != "All" and sel_month:
+    metric_month = None
+    if sel_year != "All" and sel_month_name != "All":
         try:
-            y, m = sel_month.split("-")
-            metric_year, metric_month = int(y), int(m)
+            metric_year = int(sel_year)
+            # month name -> month number
+            inv_map = {v: k for k, v in month_map.items()}
+            metric_month = inv_map.get(sel_month_name)
         except Exception:
-            pass
+            metric_year = metric_month = None
     else:
-        # choose most recent month from merged_all if available
+        # fallback: pick latest month from merged_all
         if not merged_all.empty:
             latest = merged_all["Date"].max()
             metric_year = int(latest.year)
             metric_month = int(latest.month)
 
-    # compute metrics for selected month and previous month (from merged_all)
     metric_avg = metric_count = prev_avg = prev_count = None
     if metric_year is not None and metric_month is not None:
         try:
@@ -356,6 +363,17 @@ def main():
             prev_avg, prev_count, _ = _compute_month_avg_from_merged(merged_all, int(prev_dt.year), int(prev_dt.month), replace_outliers=exclude_outliers)
         except Exception:
             metric_avg = prev_avg = None
+
+    # ------------------ Top-right compact metric (small title as requested) ------------------
+    top_left, top_mid, top_right = st.columns([6, 2, 2])
+    with top_right:
+        title_small = "mont avg apent"  # exact label requested
+        if metric_avg is None:
+            display_val = "N/A"
+        else:
+            display_val = f"₹{metric_avg:,.2f}"
+        st.markdown(f"<div style='text-align:right; font-size:12px; color:#444'>{title_small}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='text-align:right; font-size:18px; font-weight:700'>{display_val}</div>", unsafe_allow_html=True)
 
     # ------------------ Charts ------------------
     st.subheader("📊 Charts")
@@ -367,7 +385,6 @@ def main():
             series_selected.append("Total_Credit")
         try:
             charts_mod.render_chart(merged, filtered_df, chart_type, series_selected, top_n=top_n, height=420)
-            # we intentionally removed the tip text about enabling credits
         except Exception as e:
             st.error("Chart rendering failed. See traceback below.")
             st.exception(e)
@@ -466,7 +483,7 @@ def main():
                         st.session_state.reload_key += 1
                         st.experimental_rerun()
 
-    # ------------------ Add New Row (date picker only) ------------------
+    # ------------------ Add New Row (date picker only, choose bank from data or Other) ------------------
     st.markdown("---")
     st.write("➕ Add a new transaction")
 
@@ -488,8 +505,8 @@ def main():
         with st.expander("Add new row"):
             with st.form("add_row_form", clear_on_submit=True):
                 new_date = st.date_input("Date (picker)", value=datetime.utcnow().date())
-                # Bank selection: pick from data OR enter manual value
-                add_bank_options = banks.copy() if banks else ["Unknown"]
+                # Bank selection: pick from session_state bank list OR enter manual value
+                add_bank_options = st.session_state["bank_options"].copy() if st.session_state.get("bank_options") else ["Unknown"]
                 add_bank_options = sorted(list(set(add_bank_options)))
                 add_bank_options.append("Other (enter below)")
                 chosen_bank_sel = st.selectbox("Bank", options=add_bank_options, index=0, key="add_bank_select")
@@ -534,6 +551,10 @@ def main():
                         )
 
                         if res.get("status") == "ok":
+                            # add the bank to session_state bank_options so it appears in filters immediately
+                            if chosen_bank and chosen_bank not in st.session_state["bank_options"]:
+                                st.session_state["bank_options"].append(chosen_bank)
+                                st.session_state["bank_options"] = sorted(list(set(st.session_state["bank_options"])))
                             st.success("✅ Row added successfully with correct date & time!")
                             # force a quick refresh so the appended row is read back
                             st.session_state.reload_key += 1
@@ -555,7 +576,7 @@ def main():
     c2.metric("Debits", f"₹{debit_sum:,.0f}", f"{debit_count} txns")
     c3.metric("Net (Credits − Debits)", f"₹{(credit_sum - debit_sum):,.0f}")
 
-    # ------------------ Metric (Average) display also at bottom ------------------
+    # ------------------ Metric (Average) display also at bottom (detailed with delta) ------------------
     st.markdown("---")
     st.subheader("Monthly average (Selected metric month)")
     col1, col2 = st.columns([3, 1])
