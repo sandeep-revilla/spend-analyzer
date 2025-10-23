@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, date, time as dt_time
 import traceback
 import os
 from typing import Optional
+import numpy as np
 
 st.set_page_config(page_title="💳 Daily Spend Tracker", layout="wide")
 st.title("💳 Daily Spending")
@@ -71,7 +72,6 @@ def main():
         - _source_sheet: 'history' or 'append' indicating which sheet the row came from
         """
         try:
-            # Note: io_helpers.read_google_sheet should already use a wide A1 range fallback (A:AZ)
             df = io_mod.read_google_sheet(spreadsheet_id, range_name, creds_info=creds_info)
         except Exception as e:
             st.error(f"Failed to read sheet '{range_name}': {e}")
@@ -79,7 +79,6 @@ def main():
             return pd.DataFrame()
         df = df.reset_index(drop=True)
         if not df.empty:
-            # store the sheet-relative row index (first data row after header => 0)
             df["_sheet_row_idx"] = df.index.astype(int)
         df["_source_sheet"] = source_name
         return df
@@ -91,14 +90,29 @@ def main():
         app_df = _read_sheet_with_index(spreadsheet_id, range_append, "append", creds_info)
         return hist_df, app_df
 
-    # ------------------ Refresh UI ------------------
-    col_refresh, col_time = st.columns([1, 3])
-    if col_refresh.button("🔁 Refresh Data", use_container_width=True):
+    # ------------------ Sidebar: Refresh (green) + Filters ------------------
+    st.sidebar.header("Controls")
+
+    # Green refresh button in sidebar
+    st.sidebar.markdown(
+        """
+        <style>
+         /* style the sidebar button (best-effort; may affect other buttons) */
+         div[data-testid="stSidebar"] button[data-testid="stButton"] {
+           background-color: #2ecc71;
+           color: white;
+         }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    if st.sidebar.button("🔁 Refresh Data", use_container_width=True, key="refresh_button"):
         st.session_state.reload_key += 1
         st.experimental_rerun()
 
+    # show last refreshed text in main header area
     if st.session_state.last_refreshed:
-        col_time.caption(f"Last refreshed: {st.session_state.last_refreshed.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+        st.caption(f"Last refreshed: {st.session_state.last_refreshed.strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
     # ------------------ Fetch Data ------------------
     creds_info = _get_creds_info()
@@ -143,7 +157,6 @@ def main():
                 converted_df["_sheet_row_idx"] = df_raw["_sheet_row_idx"].reset_index(drop=True)
                 converted_df["_source_sheet"] = df_raw["_source_sheet"].reset_index(drop=True)
     except Exception:
-        # non-fatal: proceed without mapping if we can't restore
         pass
 
     # Ensure timestamp column is parsed early so we can compute month options
@@ -155,6 +168,14 @@ def main():
     if "Bank" not in converted_df.columns:
         converted_df["Bank"] = "Unknown"
 
+    # ------------------ Compute global (unfiltered) daily totals for metric ------------------
+    try:
+        merged_all = transform.compute_daily_totals(converted_df.copy())
+        if not merged_all.empty:
+            merged_all["Date"] = pd.to_datetime(merged_all["Date"]).dt.normalize()
+    except Exception:
+        merged_all = pd.DataFrame()
+
     # ------------------ Sidebar Filters ------------------
     st.sidebar.header("Filters")
 
@@ -162,15 +183,28 @@ def main():
     banks = sorted(converted_df["Bank"].dropna().unique().tolist())
     sel_banks = st.sidebar.multiselect("Banks", options=banks, default=banks, key="bank_filter_sidebar")
 
-    # Month filter (in sidebar)
+    # Month filter (in sidebar) - used both for charts & metric selection
     ts_valid = converted_df["timestamp"].dropna()
     if not ts_valid.empty:
-        months = sorted(ts_valid.dt.to_period("M").astype(str).unique(), reverse=True)
+        months = sorted(ts_valid.dt.to_period("M").astype(str).unique().tolist(), reverse=True)
     else:
         months = []
     month_options = ["All"] + months
     sel_month = st.sidebar.selectbox("Month", options=month_options, index=0,
                                      help="Select a calendar month to restrict the charts and totals to that month (or choose All).")
+
+    # Exclude outliers checkbox (simple text only)
+    exclude_outliers = st.sidebar.checkbox("Exclude outliers from average", value=False, key="exclude_outliers")
+
+    # Chart series defaults: debits only by default
+    show_debit = st.sidebar.checkbox("Show Debit (Total_Spent)", value=True, key="show_debit")
+    show_credit = st.sidebar.checkbox("Show Credit (Total_Credit)", value=False, key="show_credit")
+
+    # Top-N for category chart (in sidebar)
+    top_n = st.sidebar.slider("Top-N categories", 3, 20, 5, key="top_n")
+
+    # Totals mode radio (move to sidebar, keep earlier behavior)
+    totals_mode = st.sidebar.radio("Totals mode", ["Single date", "Date range"], index=0)
 
     # ------------------ Apply Filters ------------------
     filtered_df = converted_df[converted_df["Bank"].isin(sel_banks)].copy()
@@ -184,7 +218,7 @@ def main():
         except Exception:
             pass
 
-    # ------------------ Compute totals and charts ------------------
+    # ------------------ Compute totals and charts (filtered) ------------------
     with st.spinner("Computing daily totals..."):
         try:
             merged = transform.compute_daily_totals(filtered_df)
@@ -219,8 +253,6 @@ def main():
         default_sel_date = min_date
     if default_sel_date > max_date:
         default_sel_date = max_date
-
-    totals_mode = st.sidebar.radio("Totals mode", ["Single date", "Date range"], index=0)
 
     if totals_mode == "Single date":
         sel_date = st.sidebar.date_input("Pick date", value=default_sel_date, min_value=min_date, max_value=max_date)
@@ -259,23 +291,129 @@ def main():
             credit_count = int(credit_mask.sum())
             debit_count = int(debit_mask.sum())
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3 = st.columns([1.5, 1.5, 1])
     c1.metric("Credits", f"₹{credit_sum:,.0f}", f"{credit_count} txns")
     c2.metric("Debits", f"₹{debit_sum:,.0f}", f"{debit_count} txns")
     c3.metric("Net", f"₹{(credit_sum - debit_sum):,.0f}")
+
+    # ------------------ Metric (Average for selected month) ------------------
+    # Use merged_all (unfiltered) for metric computation so filters don't affect the metric.
+    def _safe_mean(s):
+        s2 = pd.to_numeric(s, errors="coerce").dropna()
+        return float(s2.mean()) if not s2.empty else None
+
+    def _compute_month_avg_from_merged(merged_df, year, month, replace_outliers=False):
+        """
+        Compute average daily Total_Spent for given year/month from merged_df (which is daily totals).
+        If replace_outliers True, use IQR rule to replace outlier daily totals with month median before averaging.
+        """
+        if merged_df is None or merged_df.empty:
+            return None, 0, {"reason": "no_data"}
+        df = merged_df.copy()
+        df["Date"] = pd.to_datetime(df["Date"])
+        mask = (df["Date"].dt.year == int(year)) & (df["Date"].dt.month == int(month))
+        dfm = df.loc[mask].copy()
+        if dfm.empty:
+            return None, 0, {"reason": "no_rows_for_month"}
+        vals = pd.to_numeric(dfm.get("Total_Spent", 0), errors="coerce").fillna(0.0)
+        if not replace_outliers or len(vals) < 3:
+            return _safe_mean(vals), int(len(vals)), {"outliers_replaced": 0, "n": len(vals)}
+        # IQR detection & replacement
+        q1 = vals.quantile(0.25)
+        q3 = vals.quantile(0.75)
+        iqr = q3 - q1
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        is_out = (vals < lower) | (vals > upper)
+        non_out = vals[~is_out]
+        replacement = float(non_out.median()) if not non_out.empty else float(vals.median())
+        vals_repl = vals.copy()
+        vals_repl[is_out] = replacement
+        return _safe_mean(vals_repl), int(len(vals_repl)), {"outliers_replaced": int(is_out.sum()), "n": len(vals_repl)}
+
+    # Determine metric month/year (use the same sel_month control; if All pick most recent month from merged_all)
+    metric_month = None
+    metric_year = None
+    if sel_month != "All" and sel_month:
+        try:
+            y, m = sel_month.split("-")
+            metric_year, metric_month = int(y), int(m)
+        except Exception:
+            pass
+    else:
+        # choose most recent month from merged_all if available
+        if not merged_all.empty:
+            latest = merged_all["Date"].max()
+            metric_year = int(latest.year)
+            metric_month = int(latest.month)
+
+    # compute metrics for selected month and previous month (from merged_all)
+    metric_avg = metric_count = prev_avg = prev_count = None
+    if metric_year is not None and metric_month is not None:
+        try:
+            metric_avg, metric_count, _ = _compute_month_avg_from_merged(merged_all, metric_year, metric_month, replace_outliers=exclude_outliers)
+            prev_dt = datetime(metric_year, metric_month, 1) - pd.DateOffset(months=1)
+            prev_avg, prev_count, _ = _compute_month_avg_from_merged(merged_all, int(prev_dt.year), int(prev_dt.month), replace_outliers=exclude_outliers)
+        except Exception:
+            metric_avg = prev_avg = None
+
+    # Render metric in top-right
+    col_left, col_mid, col_right = st.columns([6, 2, 2])
+    with col_right:
+        if metric_year and metric_month:
+            label = pd.Timestamp(metric_year, metric_month, 1).strftime("%b-%y")
+        else:
+            label = "—"
+        if metric_avg is None:
+            metric_text = "N/A"
+        else:
+            metric_text = f"₹{metric_avg:,.2f}"
+        # delta
+        if prev_avg is None or metric_avg is None:
+            delta_html = f"<span style='color:gray'>N/A</span>"
+        else:
+            diff = metric_avg - prev_avg
+            try:
+                if abs(prev_avg) > 1e-9:
+                    pct = (diff / abs(prev_avg)) * 100.0
+                    delta_label = f"{pct:+.1f}%"
+                else:
+                    delta_label = f"{diff:+.2f}"
+            except Exception:
+                delta_label = f"{diff:+.2f}"
+
+            if diff > 0:
+                color = "red"
+                arrow = "▲"
+            elif diff < 0:
+                color = "green"
+                arrow = "▼"
+            else:
+                color = "gray"
+                arrow = "►"
+
+            delta_html = f"<span style='color:{color}; font-weight:600'>{arrow} {delta_label}</span>"
+
+        st.markdown(f"<div style='text-align:right'>"
+                    f"<div style='font-size:12px;color:#666'>{label}</div>"
+                    f"<div style='font-size:20px;font-weight:700'>{metric_text}</div>"
+                    f"<div>{delta_html}</div>"
+                    f"</div>", unsafe_allow_html=True)
 
     # ------------------ Charts ------------------
     st.subheader("📊 Charts")
     if not merged.empty and charts_mod is not None:
         chart_type = st.selectbox("Chart type", ["Daily line", "Monthly bars", "Top categories (Top-N)"], index=0)
         series_selected = []
-        if st.sidebar.checkbox("Show Debit (Total_Spent)", True):
+        if show_debit:
             series_selected.append("Total_Spent")
-        if st.sidebar.checkbox("Show Credit (Total_Credit)", True):
+        if show_credit:
             series_selected.append("Total_Credit")
-        top_n = st.sidebar.slider("Top-N categories", 3, 20, 5)
         try:
             charts_mod.render_chart(merged, filtered_df, chart_type, series_selected, top_n=top_n, height=420)
+            # If credits are hidden give a gentle tip (visible under the chart)
+            if not show_credit:
+                st.info("Tip: To view credits in the chart, enable 'Show Credit' in the sidebar.")
         except Exception as e:
             st.error("Chart rendering failed. See traceback below.")
             st.exception(e)
@@ -302,17 +440,15 @@ def main():
     if io_mod is None:
         st.info("Write operations (including remove) are disabled because io_helpers failed to import.")
     else:
-        # Ensure we have mapping columns to the original sheets
         if "_sheet_row_idx" not in rows_df.columns or "_source_sheet" not in rows_df.columns:
             st.error("Missing internal row mapping columns ('_sheet_row_idx' or '_source_sheet'). Cannot delete rows.")
             st.info("These columns are normally added automatically when reading Google Sheets. Ensure io_helpers.read_google_sheet is used.")
         else:
-            # Build selection choices labeled for readability
             def _label_for_row(r):
                 ts = r.get("timestamp")
                 bank = r.get("Bank", "")
                 amt = r.get("Amount", "")
-                msg = r.get("Message", "") or r.get("Message", "")
+                msg = r.get("Message", "") or r.get("message", "")
                 src = r.get("_source_sheet", "")
                 idx = r.get("_sheet_row_idx", "")
                 msg_short = (str(msg)[:40] + "...") if msg and len(str(msg)) > 40 else str(msg)
@@ -340,7 +476,6 @@ def main():
                         selected_keys.append(k)
                         break
 
-            # Confirmation: require checkbox
             confirm = st.checkbox("I confirm I want to mark the selected rows as deleted")
 
             if st.button("Mark selected rows deleted"):
@@ -381,7 +516,7 @@ def main():
     st.markdown("---")
     st.write("➕ Add a new transaction")
 
-    def build_timestamp_str(chosen_date: date, chosen_time: dt_time) -> str:
+    def build_timestamp_str(chosen_date: date, chosen_time: dt_time) -> (str, datetime):
         """
         Format datetime in 'YYYY-MM-DD HH:MM:SS' using chosen date + chosen time.
         chosen_time is a datetime.time object; if None, use current UTC time.
@@ -400,7 +535,6 @@ def main():
         with st.expander("Add new row"):
             with st.form("add_row_form", clear_on_submit=True):
                 new_date = st.date_input("Date (picker)", value=datetime.utcnow().date())
-                # new: time picker so user can specify the exact time that will be saved
                 new_time = st.time_input("Time (UTC)", value=datetime.utcnow().time())
                 bank = st.text_input("Bank", "HDFC Bank")
                 txn_type = st.selectbox("Type", ["debit", "credit"])
