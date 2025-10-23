@@ -12,6 +12,7 @@ import numpy as np
 st.set_page_config(page_title="💳 Daily Spend Tracker", layout="wide")
 st.title("💳 Daily Spending")
 
+
 def main():
     # ------------------ Module Imports ------------------
     try:
@@ -42,9 +43,11 @@ def main():
 
     if not SHEET_ID or not RANGE or not APPEND_RANGE:
         st.error("Missing Google Sheet secrets: SHEET_ID, RANGE, APPEND_RANGE.")
-        st.info("For local testing create .streamlit/secrets.toml with keys:\n\n"
-                'SHEET_ID = "your-sheet-id"\nRANGE = "History Transactions"\nAPPEND_RANGE = "Append Transactions"\n\n'
-                "Or set the keys in Streamlit Cloud app settings.")
+        st.info(
+            "For local testing create .streamlit/secrets.toml with keys:\n\n"
+            'SHEET_ID = "your-sheet-id"\nRANGE = "History Transactions"\nAPPEND_RANGE = "Append Transactions"\n\n'
+            "Or set the keys in Streamlit Cloud app settings."
+        )
         return
 
     # ------------------ Session State ------------------
@@ -508,11 +511,11 @@ def main():
                 # Bank selection: pick from session_state bank list OR enter manual value
                 add_bank_options = st.session_state["bank_options"].copy() if st.session_state.get("bank_options") else ["Unknown"]
                 add_bank_options = sorted(list(set(add_bank_options)))
-                add_bank_options.append("Other (enter below)")
+                if "Other (enter below)" not in add_bank_options:
+                    add_bank_options.append("Other (enter below)")
                 chosen_bank_sel = st.selectbox("Bank", options=add_bank_options, index=0, key="add_bank_select")
-                bank_other = ""
-                if chosen_bank_sel == "Other (enter below)":
-                    bank_other = st.text_input("Bank (custom)", value="", key="add_bank_other")
+                # Always show the custom bank text input (more discoverable); enable/disable based on selectbox
+                bank_other = st.text_input("Bank (custom) — used when 'Other (enter below)' selected", value="", key="add_bank_other")
                 txn_type = st.selectbox("Type", ["debit", "credit"])
                 amount = st.number_input("Amount (₹)", min_value=0.0, step=1.0, format="%.2f")
                 msg = st.text_input("Message / Description", "")
@@ -542,6 +545,10 @@ def main():
                             "is_deleted": "false",
                         }
 
+                        # Validate required fields minimally
+                        if chosen_bank == "Unknown":
+                            # let it still append if user explicitly chose Unknown, but prefer to prompt
+                            st.info("Bank will be recorded as 'Unknown'. If you meant to add a custom name, fill the custom bank field and submit again.")
                         res = io_mod.append_new_row(
                             spreadsheet_id=SHEET_ID,
                             range_name=APPEND_RANGE,
@@ -615,11 +622,14 @@ def main():
 
             delta_html = f"<span style='color:{color}; font-weight:600'>{arrow} {delta_label}</span>"
 
-        st.markdown(f"<div style='text-align:right'>"
-                    f"<div style='font-size:12px;color:#666'>{label}</div>"
-                    f"<div style='font-size:20px;font-weight:700'>{metric_text}</div>"
-                    f"<div>{delta_html}</div>"
-                    f"</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='text-align:right'>"
+            f"<div style='font-size:12px;color:#666'>{label}</div>"
+            f"<div style='font-size:20px;font-weight:700'>{metric_text}</div>"
+            f"<div>{delta_html}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
 
 if __name__ == "__main__":
