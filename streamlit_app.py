@@ -2,12 +2,9 @@
 import streamlit as st
 import pandas as pd
 import importlib
-import re
-from datetime import datetime, timedelta, date, time as dt_time
+from datetime import datetime, date
 import traceback
-import os
 from typing import Optional
-import numpy as np
 
 st.set_page_config(page_title="💳 Daily Spend Tracker", layout="wide")
 st.title("💳 Daily Spending")
@@ -53,11 +50,8 @@ def main():
     # ------------------ Session State ------------------
     if "reload_key" not in st.session_state:
         st.session_state.reload_key = 0
-
     if "last_refreshed" not in st.session_state:
         st.session_state.last_refreshed = None
-
-    # We'll keep an in-memory bank list so we can add new banks immediately after append
     if "bank_options" not in st.session_state:
         st.session_state["bank_options"] = None
 
@@ -73,11 +67,6 @@ def main():
         return None
 
     def _read_sheet_with_index(spreadsheet_id: str, range_name: str, source_name: str, creds_info: Optional[dict]):
-        """
-        Reads the sheet and ensures two helper columns are present:
-        - _sheet_row_idx: 0-based index of the data row (first data row after header is 0)
-        - _source_sheet: 'history' or 'append' indicating which sheet the row came from
-        """
         try:
             df = io_mod.read_google_sheet(spreadsheet_id, range_name, creds_info=creds_info)
         except Exception as e:
@@ -90,21 +79,17 @@ def main():
         df["_source_sheet"] = source_name
         return df
 
-    # Reduced cache TTL to allow quick refreshes while testing appends.
     @st.cache_data(ttl=3, show_spinner=False)
     def fetch_sheets(spreadsheet_id, range_hist, range_append, creds_info, reload_key):
         hist_df = _read_sheet_with_index(spreadsheet_id, range_hist, "history", creds_info)
         app_df = _read_sheet_with_index(spreadsheet_id, range_append, "append", creds_info)
         return hist_df, app_df
 
-    # ------------------ Sidebar: Refresh (green) + Controls ------------------
+    # ------------------ Sidebar: Refresh + Controls ------------------
     st.sidebar.header("Controls")
-
-    # Green refresh button in sidebar (best-effort styling)
     st.sidebar.markdown(
         """
         <style>
-         /* style the sidebar button (best-effort; may affect other buttons) */
          div[data-testid="stSidebar"] button[data-testid="stButton"] {
            background-color: #2ecc71;
            color: white;
@@ -117,7 +102,6 @@ def main():
         st.session_state.reload_key += 1
         st.experimental_rerun()
 
-    # show last refreshed text in main header area
     if st.session_state.last_refreshed:
         st.caption(f"Last refreshed: {st.session_state.last_refreshed.strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
@@ -136,7 +120,6 @@ def main():
         st.error("No data found in the Google Sheet.")
         return
 
-    # keep df_raw (concatenation of both sheets) for possible mapping restoration
     df_raw = pd.concat([history_df, append_df], ignore_index=True, sort=False)
 
     # ------------------ Filter Deleted ------------------
@@ -157,7 +140,7 @@ def main():
         st.text(traceback.format_exc())
         return
 
-    # If transform dropped the internal mapping columns but the row counts match, restore them
+    # restore mapping cols if transform removed them
     try:
         if ("_sheet_row_idx" not in converted_df.columns or "_source_sheet" not in converted_df.columns):
             if ("_sheet_row_idx" in df_raw.columns) and ("_source_sheet" in df_raw.columns) and (len(df_raw) == len(converted_df)):
@@ -166,7 +149,6 @@ def main():
     except Exception:
         pass
 
-    # Ensure timestamp column is parsed early so we can compute month / year options
     if "timestamp" in converted_df.columns:
         converted_df["timestamp"] = pd.to_datetime(converted_df["timestamp"], errors="coerce")
     else:
@@ -175,7 +157,7 @@ def main():
     if "Bank" not in converted_df.columns:
         converted_df["Bank"] = "Unknown"
 
-    # ------------------ Compute global (unfiltered) daily totals for metric ------------------
+    # ------------------ Compute global daily totals ------------------
     try:
         merged_all = transform.compute_daily_totals(converted_df.copy())
         if not merged_all.empty:
@@ -185,17 +167,13 @@ def main():
 
     # ------------------ Sidebar Filters ------------------
     st.sidebar.header("Filters")
-
-    # Bank filter computed dynamically from data
     banks = sorted([b for b in converted_df["Bank"].dropna().unique().tolist()])
     if not banks:
         banks = ["Unknown"]
 
-    # initialize session_state bank_options if not set
     if st.session_state.get("bank_options") is None:
         st.session_state["bank_options"] = banks.copy()
     else:
-        # ensure session state contains all banks present in data (in case history had banks not present earlier)
         for b in banks:
             if b not in st.session_state["bank_options"]:
                 st.session_state["bank_options"].append(b)
@@ -203,7 +181,6 @@ def main():
 
     sel_banks = st.sidebar.multiselect("Banks", options=st.session_state["bank_options"], default=st.session_state["bank_options"], key="bank_filter_sidebar")
 
-    # Year & Month filters for monthly average (separate controls)
     ts_valid = converted_df["timestamp"].dropna()
     years = sorted(ts_valid.dt.year.unique().tolist(), reverse=True) if not ts_valid.empty else []
     year_options = ["All"] + [str(y) for y in years]
@@ -213,26 +190,17 @@ def main():
     month_options = ["All"] + [month_map[i] for i in range(1, 13)]
     sel_month_name = st.sidebar.selectbox("Month (for monthly average)", options=month_options, index=0)
 
-    # Exclude outliers checkbox (simple text only)
     exclude_outliers = st.sidebar.checkbox("Exclude outliers from average", value=False, key="exclude_outliers")
-
-    # Chart series defaults: debits only by default
     show_debit = st.sidebar.checkbox("Show Debit (Total_Spent)", value=True, key="show_debit")
     show_credit = st.sidebar.checkbox("Show Credit (Total_Credit)", value=False, key="show_credit")
-
-    # Chart type moved to sidebar
     chart_type = st.sidebar.selectbox("Chart type", ["Daily line", "Monthly bars", "Top categories (Top-N)"], index=0)
-
-    # Top-N for category chart (in sidebar)
     top_n = st.sidebar.slider("Top-N categories", 3, 20, 5, key="top_n")
-
-    # Totals mode radio (move to sidebar, keep earlier behavior)
     totals_mode = st.sidebar.radio("Totals mode", ["Single date", "Date range"], index=0)
 
-    # ------------------ Apply Filters ------------------ 
+    # ------------------ Apply Filters ------------------
     filtered_df = converted_df[converted_df["Bank"].isin(sel_banks)].copy()
 
-    # ------------------ Compute filtered daily totals used for charts ------------------
+    # compute filtered daily totals for charts
     with st.spinner("Computing daily totals..."):
         try:
             merged = transform.compute_daily_totals(filtered_df)
@@ -246,11 +214,6 @@ def main():
         merged["Date"] = pd.to_datetime(merged["Date"]).dt.normalize()
 
     # ------------------ Date Range (for rows & totals) ------------------
-    if "timestamp" not in filtered_df.columns:
-        filtered_df["timestamp"] = pd.to_datetime(filtered_df.get("date"), errors="coerce")
-    else:
-        filtered_df["timestamp"] = pd.to_datetime(filtered_df["timestamp"], errors="coerce")
-
     valid_dates = filtered_df["timestamp"].dropna()
     if valid_dates.empty:
         st.warning("No valid dates found.")
@@ -258,7 +221,6 @@ def main():
 
     min_date, max_date = valid_dates.min().date(), valid_dates.max().date()
     today = datetime.utcnow().date()
-
     if min_date > max_date:
         min_date, max_date = max_date, min_date
 
@@ -285,7 +247,7 @@ def main():
         else:
             start_sel, end_sel = dr, dr
 
-    # ------------------ Compute totals for selected date/range (for rows & summary metrics) ------------------
+    # ------------------ Compute totals for selected date/range ------------------
     tmp = filtered_df.copy()
     mask = tmp["timestamp"].dt.date.between(start_sel, end_sel)
     sel_df = tmp.loc[mask]
@@ -305,15 +267,12 @@ def main():
             credit_count = int(credit_mask.sum())
             debit_count = int(debit_mask.sum())
 
-    # ------------------ Monthly average metric logic (uses separate Year + Month selectors) ------------------
+    # ------------------ Monthly average metric logic ------------------
     def _safe_mean(s):
         s2 = pd.to_numeric(s, errors="coerce").dropna()
         return float(s2.mean()) if not s2.empty else None
 
     def _compute_month_avg_from_merged(merged_df, year, month, replace_outliers=False):
-        """
-        same IQR replacement logic as before
-        """
         if merged_df is None or merged_df.empty:
             return None, 0, {"reason": "no_data"}
         df = merged_df.copy()
@@ -337,19 +296,16 @@ def main():
         vals_repl[is_out] = replacement
         return _safe_mean(vals_repl), int(len(vals_repl)), {"outliers_replaced": int(is_out.sum()), "n": len(vals_repl)}
 
-    # Determine which month/year to compute the metric for based on sidebar controls
     metric_year = None
     metric_month = None
     if sel_year != "All" and sel_month_name != "All":
         try:
             metric_year = int(sel_year)
-            # month name -> month number
             inv_map = {v: k for k, v in month_map.items()}
             metric_month = inv_map.get(sel_month_name)
         except Exception:
             metric_year = metric_month = None
     else:
-        # fallback: pick latest month from merged_all
         if not merged_all.empty:
             latest = merged_all["Date"].max()
             metric_year = int(latest.year)
@@ -367,10 +323,9 @@ def main():
     # ------------------ Top-right compact metric (dynamic title like "oct AVG spent") ------------------
     top_left, top_mid, top_right = st.columns([6, 2, 2])
     with top_right:
-        # month label like "Sep-25" -> we will use abbreviated month for title
         if metric_year and metric_month:
-            month_label_abbr = pd.Timestamp(metric_year, metric_month, 1).strftime("%b")  # e.g., "Oct"
-            title_small = f"{month_label_abbr.lower()} AVG spent"  # e.g., "oct AVG spent"
+            month_label_abbr = pd.Timestamp(metric_year, metric_month, 1).strftime("%b")
+            title_small = f"{month_label_abbr.lower()} AVG spent"
         else:
             title_small = "AVG spent"
 
@@ -379,7 +334,6 @@ def main():
         else:
             metric_text = f"₹{metric_avg:,.2f}"
 
-        # delta calculation
         if prev_avg is None or metric_avg is None:
             delta_html = f"<div style='text-align:right; color:gray; font-weight:600'>N/A</div>"
         else:
@@ -405,7 +359,6 @@ def main():
 
             delta_html = f"<div style='text-align:right; color:{color}; font-weight:700'>{arrow} {delta_label}</div>"
 
-        # Render: dynamic small title, month label (for clarity), amount (big), delta (colored)
         if metric_year and metric_month:
             month_label_display = pd.Timestamp(metric_year, metric_month, 1).strftime("%b-%y")
         else:
@@ -529,16 +482,11 @@ def main():
                         st.session_state.reload_key += 1
                         st.experimental_rerun()
 
-    # ------------------ Add New Row (date picker only, choose bank from data or manual checkbox) ------------------
+    # ------------------ Add New Row (always-show text input but disabled until checkbox checked) ------------------
     st.markdown("---")
     st.write("➕ Add a new transaction")
 
-    def build_timestamp_str_using_now(chosen_date: date) -> (str, datetime):
-        """
-        Format datetime in 'MM/DD/YYYY HH:MM' using chosen date + current UTC time at submit.
-        Returns (formatted_string, datetime_object).
-        Example: '10/23/2025 18:26'
-        """
+    def build_timestamp_str_using_now(chosen_date: date):
         now = datetime.utcnow()
         try:
             dt_combined = datetime.combine(chosen_date, now.time())
@@ -551,19 +499,17 @@ def main():
         with st.expander("Add new row"):
             with st.form("add_row_form", clear_on_submit=True):
                 new_date = st.date_input("Date (picker)", value=datetime.utcnow().date())
-                # Bank selection: pick from session_state bank list OR enter manual value (via checkbox)
+
                 add_bank_options = st.session_state["bank_options"].copy() if st.session_state.get("bank_options") else ["Unknown"]
                 add_bank_options = sorted(list(set(add_bank_options)))
-                # DO NOT append "Other (enter below)" anymore — manual entry is handled by a checkbox below
 
-                # Selectbox for bank
                 chosen_bank_sel = st.selectbox("Bank", options=add_bank_options, index=0, key="add_bank_select")
 
                 # Checkbox to enable manual bank entry
                 manual_bank = st.checkbox("Add new bank manually", value=False, key="add_bank_manual")
-                bank_other = ""
-                if manual_bank:
-                    bank_other = st.text_input("Enter bank name", value="", key="add_bank_other")
+
+                # Always render the text input but disable it unless manual_bank is True.
+                bank_other = st.text_input("Enter bank name (editable when checkbox checked)", value="", key="add_bank_other", disabled=not manual_bank)
 
                 txn_type = st.selectbox("Type", ["debit", "credit"])
                 amount = st.number_input("Amount (₹)", min_value=0.0, step=1.0, format="%.2f")
@@ -572,7 +518,6 @@ def main():
 
                 if submit_add:
                     try:
-                        # choose bank value: manual if checkbox checked, otherwise dropdown value
                         if manual_bank:
                             chosen_bank = bank_other.strip() if bank_other and bank_other.strip() else "Unknown"
                         else:
@@ -581,11 +526,8 @@ def main():
                         timestamp_str, timestamp_dt = build_timestamp_str_using_now(new_date)
 
                         new_row = {
-                            # DateTime string exactly as requested (MM/DD/YYYY HH:MM)
                             "DateTime": timestamp_str,
-                            # timestamp object preserved for transform parsing
                             "timestamp": timestamp_dt,
-                            # date cell written in same readable full format (optional)
                             "date": timestamp_dt.strftime("%m/%d/%Y %H:%M"),
                             "Bank": chosen_bank,
                             "Type": txn_type,
@@ -594,9 +536,7 @@ def main():
                             "is_deleted": "false",
                         }
 
-                        # Validate required fields minimally
                         if chosen_bank == "Unknown":
-                            # let it still append if user explicitly chose Unknown, but prefer to prompt
                             st.info("Bank will be recorded as 'Unknown'. If you meant to add a custom name, check the 'Add new bank manually' box and submit again.")
                         res = io_mod.append_new_row(
                             spreadsheet_id=SHEET_ID,
@@ -607,12 +547,10 @@ def main():
                         )
 
                         if res.get("status") == "ok":
-                            # add the bank to session_state bank_options so it appears in filters immediately
                             if chosen_bank and chosen_bank not in st.session_state["bank_options"]:
                                 st.session_state["bank_options"].append(chosen_bank)
                                 st.session_state["bank_options"] = sorted(list(set(st.session_state["bank_options"])))
                             st.success("✅ Row added successfully with correct date & time!")
-                            # force a quick refresh so the appended row is read back
                             st.session_state.reload_key += 1
                             st.experimental_rerun()
                         else:
@@ -624,13 +562,14 @@ def main():
     else:
         st.info("Write operations disabled: io_helpers module unavailable.")
 
-    # ------------------ Move Debits/Credits/Net metrics to bottom (after everything) ------------------
+    # ------------------ Summary (Selected date/range) ------------------
     st.markdown("---")
     st.subheader("Summary (Selected date/range)")
     c1, c2, c3 = st.columns([1.5, 1.5, 1])
     c1.metric("Credits", f"₹{credit_sum:,.0f}", f"{credit_count} txns")
     c2.metric("Debits", f"₹{debit_sum:,.0f}", f"{debit_count} txns")
     c3.metric("Net (Credits − Debits)", f"₹{(credit_sum - debit_sum):,.0f}")
+
 
 if __name__ == "__main__":
     try:
