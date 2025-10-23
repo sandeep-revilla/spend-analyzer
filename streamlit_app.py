@@ -93,7 +93,7 @@ def main():
     # ------------------ Sidebar: Refresh (green) + Filters ------------------
     st.sidebar.header("Controls")
 
-    # Green refresh button in sidebar
+    # Green refresh button in sidebar (best-effort styling)
     st.sidebar.markdown(
         """
         <style>
@@ -179,8 +179,10 @@ def main():
     # ------------------ Sidebar Filters ------------------
     st.sidebar.header("Filters")
 
-    # Bank filter moved to sidebar
-    banks = sorted(converted_df["Bank"].dropna().unique().tolist())
+    # Bank filter computed dynamically from data (not static)
+    banks = sorted([b for b in converted_df["Bank"].dropna().unique().tolist()])
+    if not banks:
+        banks = ["Unknown"]
     sel_banks = st.sidebar.multiselect("Banks", options=banks, default=banks, key="bank_filter_sidebar")
 
     # Month filter (in sidebar) - used both for charts & metric selection
@@ -199,6 +201,9 @@ def main():
     # Chart series defaults: debits only by default
     show_debit = st.sidebar.checkbox("Show Debit (Total_Spent)", value=True, key="show_debit")
     show_credit = st.sidebar.checkbox("Show Credit (Total_Credit)", value=False, key="show_credit")
+
+    # Chart type moved to sidebar
+    chart_type = st.sidebar.selectbox("Chart type", ["Daily line", "Monthly bars", "Top categories (Top-N)"], index=0)
 
     # Top-N for category chart (in sidebar)
     top_n = st.sidebar.slider("Top-N categories", 3, 20, 5, key="top_n")
@@ -271,7 +276,7 @@ def main():
         else:
             start_sel, end_sel = dr, dr
 
-    # ------------------ Totals ------------------
+    # ------------------ Compute totals for selected date/range (kept here but UI moved) ------------------
     tmp = filtered_df.copy()
     mask = tmp["timestamp"].dt.date.between(start_sel, end_sel)
     sel_df = tmp.loc[mask]
@@ -290,11 +295,6 @@ def main():
             debit_sum = sel_df.loc[debit_mask, "amt"].sum()
             credit_count = int(credit_mask.sum())
             debit_count = int(debit_mask.sum())
-
-    c1, c2, c3 = st.columns([1.5, 1.5, 1])
-    c1.metric("Credits", f"₹{credit_sum:,.0f}", f"{credit_count} txns")
-    c2.metric("Debits", f"₹{debit_sum:,.0f}", f"{debit_count} txns")
-    c3.metric("Net", f"₹{(credit_sum - debit_sum):,.0f}")
 
     # ------------------ Metric (Average for selected month) ------------------
     # Use merged_all (unfiltered) for metric computation so filters don't affect the metric.
@@ -357,53 +357,9 @@ def main():
         except Exception:
             metric_avg = prev_avg = None
 
-    # Render metric in top-right
-    col_left, col_mid, col_right = st.columns([6, 2, 2])
-    with col_right:
-        if metric_year and metric_month:
-            label = pd.Timestamp(metric_year, metric_month, 1).strftime("%b-%y")
-        else:
-            label = "—"
-        if metric_avg is None:
-            metric_text = "N/A"
-        else:
-            metric_text = f"₹{metric_avg:,.2f}"
-        # delta
-        if prev_avg is None or metric_avg is None:
-            delta_html = f"<span style='color:gray'>N/A</span>"
-        else:
-            diff = metric_avg - prev_avg
-            try:
-                if abs(prev_avg) > 1e-9:
-                    pct = (diff / abs(prev_avg)) * 100.0
-                    delta_label = f"{pct:+.1f}%"
-                else:
-                    delta_label = f"{diff:+.2f}"
-            except Exception:
-                delta_label = f"{diff:+.2f}"
-
-            if diff > 0:
-                color = "red"
-                arrow = "▲"
-            elif diff < 0:
-                color = "green"
-                arrow = "▼"
-            else:
-                color = "gray"
-                arrow = "►"
-
-            delta_html = f"<span style='color:{color}; font-weight:600'>{arrow} {delta_label}</span>"
-
-        st.markdown(f"<div style='text-align:right'>"
-                    f"<div style='font-size:12px;color:#666'>{label}</div>"
-                    f"<div style='font-size:20px;font-weight:700'>{metric_text}</div>"
-                    f"<div>{delta_html}</div>"
-                    f"</div>", unsafe_allow_html=True)
-
     # ------------------ Charts ------------------
     st.subheader("📊 Charts")
     if not merged.empty and charts_mod is not None:
-        chart_type = st.selectbox("Chart type", ["Daily line", "Monthly bars", "Top categories (Top-N)"], index=0)
         series_selected = []
         if show_debit:
             series_selected.append("Total_Spent")
@@ -411,9 +367,7 @@ def main():
             series_selected.append("Total_Credit")
         try:
             charts_mod.render_chart(merged, filtered_df, chart_type, series_selected, top_n=top_n, height=420)
-            # If credits are hidden give a gentle tip (visible under the chart)
-            if not show_credit:
-                st.info("Tip: To view credits in the chart, enable 'Show Credit' in the sidebar.")
+            # we intentionally removed the tip text about enabling credits
         except Exception as e:
             st.error("Chart rendering failed. See traceback below.")
             st.exception(e)
@@ -512,31 +466,36 @@ def main():
                         st.session_state.reload_key += 1
                         st.experimental_rerun()
 
-    # ------------------ Add New Row (date + time picker) ------------------
+    # ------------------ Add New Row (date picker only) ------------------
     st.markdown("---")
     st.write("➕ Add a new transaction")
 
-    def build_timestamp_str(chosen_date: date, chosen_time: dt_time) -> (str, datetime):
+    def build_timestamp_str_using_now(chosen_date: date) -> (str, datetime):
         """
-        Format datetime in 'YYYY-MM-DD HH:MM:SS' using chosen date + chosen time.
-        chosen_time is a datetime.time object; if None, use current UTC time.
+        Format datetime in 'MM/DD/YYYY HH:MM' using chosen date + current UTC time at submit.
+        Returns (formatted_string, datetime_object).
+        Example: '10/23/2025 18:26'
         """
-        if chosen_time is None:
-            t = datetime.utcnow().time()
-        else:
-            t = chosen_time
+        now = datetime.utcnow()
         try:
-            dt_combined = datetime.combine(chosen_date, t)
+            dt_combined = datetime.combine(chosen_date, now.time())
         except Exception:
-            dt_combined = datetime.utcnow()
-        return dt_combined.strftime("%Y-%m-%d %H:%M:%S"), dt_combined
+            dt_combined = now
+        formatted = dt_combined.strftime("%m/%d/%Y %H:%M")
+        return formatted, dt_combined
 
     if io_mod is not None:
         with st.expander("Add new row"):
             with st.form("add_row_form", clear_on_submit=True):
                 new_date = st.date_input("Date (picker)", value=datetime.utcnow().date())
-                new_time = st.time_input("Time (UTC)", value=datetime.utcnow().time())
-                bank = st.text_input("Bank", "HDFC Bank")
+                # Bank selection: pick from data OR enter manual value
+                add_bank_options = banks.copy() if banks else ["Unknown"]
+                add_bank_options = sorted(list(set(add_bank_options)))
+                add_bank_options.append("Other (enter below)")
+                chosen_bank_sel = st.selectbox("Bank", options=add_bank_options, index=0, key="add_bank_select")
+                bank_other = ""
+                if chosen_bank_sel == "Other (enter below)":
+                    bank_other = st.text_input("Bank (custom)", value="", key="add_bank_other")
                 txn_type = st.selectbox("Type", ["debit", "credit"])
                 amount = st.number_input("Amount (₹)", min_value=0.0, step=1.0, format="%.2f")
                 msg = st.text_input("Message / Description", "")
@@ -544,13 +503,22 @@ def main():
 
                 if submit_add:
                     try:
-                        timestamp_str, timestamp_dt = build_timestamp_str(new_date, new_time)
+                        # choose bank value (manual override if Other selected)
+                        if chosen_bank_sel == "Other (enter below)":
+                            chosen_bank = bank_other.strip() if bank_other and bank_other.strip() else "Unknown"
+                        else:
+                            chosen_bank = chosen_bank_sel if chosen_bank_sel else "Unknown"
+
+                        timestamp_str, timestamp_dt = build_timestamp_str_using_now(new_date)
 
                         new_row = {
+                            # DateTime string exactly as requested (MM/DD/YYYY HH:MM)
                             "DateTime": timestamp_str,
+                            # timestamp object preserved for transform parsing
                             "timestamp": timestamp_dt,
-                            "date": new_date.isoformat(),
-                            "Bank": bank,
+                            # date cell written in same readable full format (optional)
+                            "date": timestamp_dt.strftime("%m/%d/%Y %H:%M"),
+                            "Bank": chosen_bank,
                             "Type": txn_type,
                             "Amount": amount,
                             "Message": msg,
@@ -578,6 +546,60 @@ def main():
                         st.text(traceback.format_exc())
     else:
         st.info("Write operations disabled: io_helpers module unavailable.")
+
+    # ------------------ Move Debits/Credits/Net metrics to bottom (after everything) ------------------
+    st.markdown("---")
+    st.subheader("Summary (Selected date/range)")
+    c1, c2, c3 = st.columns([1.5, 1.5, 1])
+    c1.metric("Credits", f"₹{credit_sum:,.0f}", f"{credit_count} txns")
+    c2.metric("Debits", f"₹{debit_sum:,.0f}", f"{debit_count} txns")
+    c3.metric("Net (Credits − Debits)", f"₹{(credit_sum - debit_sum):,.0f}")
+
+    # ------------------ Metric (Average) display also at bottom ------------------
+    st.markdown("---")
+    st.subheader("Monthly average (Selected metric month)")
+    col1, col2 = st.columns([3, 1])
+    with col2:
+        if metric_year and metric_month:
+            label = pd.Timestamp(metric_year, metric_month, 1).strftime("%b-%y")
+        else:
+            label = "—"
+        if metric_avg is None:
+            metric_text = "N/A"
+        else:
+            metric_text = f"₹{metric_avg:,.2f}"
+        # delta
+        if prev_avg is None or metric_avg is None:
+            delta_html = f"<span style='color:gray'>N/A</span>"
+        else:
+            diff = metric_avg - prev_avg
+            try:
+                if abs(prev_avg) > 1e-9:
+                    pct = (diff / abs(prev_avg)) * 100.0
+                    delta_label = f"{pct:+.1f}%"
+                else:
+                    delta_label = f"{diff:+.2f}"
+            except Exception:
+                delta_label = f"{diff:+.2f}"
+
+            if diff > 0:
+                color = "red"
+                arrow = "▲"
+            elif diff < 0:
+                color = "green"
+                arrow = "▼"
+            else:
+                color = "gray"
+                arrow = "►"
+
+            delta_html = f"<span style='color:{color}; font-weight:600'>{arrow} {delta_label}</span>"
+
+        st.markdown(f"<div style='text-align:right'>"
+                    f"<div style='font-size:12px;color:#666'>{label}</div>"
+                    f"<div style='font-size:20px;font-weight:700'>{metric_text}</div>"
+                    f"<div>{delta_html}</div>"
+                    f"</div>", unsafe_allow_html=True)
+
 
 if __name__ == "__main__":
     try:
