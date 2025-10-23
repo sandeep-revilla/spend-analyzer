@@ -14,7 +14,7 @@ def _ensure_date_col(df: pd.DataFrame, col: str = "Date") -> pd.DataFrame:
     """Ensure the given column is in datetime format."""
     if col in df.columns:
         df = df.copy()
-        df[col] = pd.to_datetime(df[col], errors="coerce")
+        df[col] = pd.to_datetime(df[col], errors='coerce')
     return df
 
 
@@ -84,10 +84,12 @@ def render_chart(
 
 # ------------------ Daily Line Chart ------------------ #
 def _render_daily_line(plot_df: pd.DataFrame, converted_df: pd.DataFrame, series_selected: List[str], height: int):
-    """Render interactive daily line chart with transaction drilldown."""
+    """Render interactive daily line chart with transaction drilldown and hint overlay when credits hidden."""
     df = _ensure_date_col(plot_df, "Date")
+    # vars_to_plot come from series_selected but must exist in df
     vars_to_plot = [c for c in ['Total_Spent', 'Total_Credit'] if c in series_selected and c in df.columns]
 
+    # If no series selected, inform the user
     if not vars_to_plot:
         st.info("No series selected for plotting.")
         return
@@ -110,7 +112,7 @@ def _render_daily_line(plot_df: pd.DataFrame, converted_df: pd.DataFrame, series
         opacity=alt.condition(date_sel, alt.value(1.0), alt.value(0.8))
     ).add_selection(date_sel).interactive()
 
-    # If no transaction data, just show the top chart
+    # If no transaction detail data, show chart only
     if converted_df is None or converted_df.empty:
         st.altair_chart(base.properties(height=height), use_container_width=True)
         return
@@ -140,8 +142,35 @@ def _render_daily_line(plot_df: pd.DataFrame, converted_df: pd.DataFrame, series
         ]
     ).properties(height=max(120, int(height * 0.35)))
 
+    # Build hint overlay if credit transactions exist in converted_df but 'Total_Credit' not selected
+    show_credit_selected = 'Total_Credit' in series_selected
+    credit_exists_in_tx = False
+    try:
+        if 'Type' in converted_df.columns:
+            credit_exists_in_tx = converted_df['Type'].astype(str).str.lower().eq('credit').any()
+        # fallback: if Total_Credit exists in plot_df and has non-zero values
+        if not credit_exists_in_tx and 'Total_Credit' in plot_df.columns:
+            credit_exists_in_tx = pd.to_numeric(plot_df['Total_Credit'], errors='coerce').fillna(0).abs().sum() > 0
+    except Exception:
+        credit_exists_in_tx = False
+
+    # Prepare the top chart: base, possibly layered with an invisible overlay that provides a tooltip hint.
+    top_chart = base.properties(height=max(200, int(height * 0.6)))
+
+    if (not show_credit_selected) and credit_exists_in_tx:
+        # create overlay dataframe: one row per unique date with a constant hint message
+        overlay_df = pd.DataFrame({'Date': df['Date'].drop_duplicates()})
+        overlay_df['hint'] = "To view credits, enable 'Show Credit' in the sidebar."
+        # small non-zero opacity required for altair to trigger tooltip; make it effectively invisible
+        overlay = alt.Chart(overlay_df).mark_point(size=100, opacity=0.001).encode(
+            x=alt.X('Date:T'),
+            tooltip=[alt.Tooltip('hint:N', title='Hint')]
+        )
+        # layer overlay on top of line chart so hovering shows tooltip
+        top_chart = alt.layer(top_chart, overlay).properties(height=max(200, int(height * 0.6)))
+
     combined = alt.vconcat(
-        base.properties(height=max(200, int(height * 0.6))),
+        top_chart,
         detail
     ).resolve_scale(color='independent')
 
