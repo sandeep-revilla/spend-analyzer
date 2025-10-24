@@ -432,7 +432,7 @@ def main():
 
             selected_labels = st.multiselect(
                 # Restored original label
-                "Select rows to remove (soft-delete). Selected rows will be marked is_deleted = TRUE.",
+                "Selected rows will be marked deleted",
                 options=labels_ordered,
                 default=[]
             )
