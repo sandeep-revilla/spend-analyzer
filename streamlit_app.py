@@ -323,11 +323,10 @@ def main():
     # ------------------ Top-right compact metric (dynamic title like "oct AVG spent") ------------------
     top_left, top_mid, top_right = st.columns([6, 2, 2])
     with top_right:
-        if metric_year and metric_month:
-            month_label_abbr = pd.Timestamp(metric_year, metric_month, 1).strftime("%b")
-            title_small = f"{month_label_abbr.lower()} AVG spent"
-        else:
-            title_small = "AVG spent"
+        # --- MODIFICATION 1 ---
+        # Simplified title to remove the redundant month
+        title_small = "AVG spent"
+        # --- END MODIFICATION 1 ---
 
         if metric_avg is None:
             metric_text = "N/A"
@@ -503,13 +502,11 @@ def main():
                 add_bank_options = st.session_state["bank_options"].copy() if st.session_state.get("bank_options") else ["Unknown"]
                 add_bank_options = sorted(list(set(add_bank_options)))
 
-                chosen_bank_sel = st.selectbox("Bank", options=add_bank_options, index=0, key="add_bank_select")
-
-                # Checkbox to enable manual bank entry
-                manual_bank = st.checkbox("Add new bank manually", value=False, key="add_bank_manual")
-
-                # Always render the text input but disable it unless manual_bank is True.
-                bank_other = st.text_input("Enter bank name (editable when checkbox checked)", value="", key="add_bank_other", disabled=not manual_bank)
+                # --- MODIFICATION 2 (UI) ---
+                # Replaced checkbox/disabled text_input with selectbox + optional text_input
+                chosen_bank_sel = st.selectbox("Bank (from existing)", options=add_bank_options, index=0, key="add_bank_select")
+                new_bank_input = st.text_input("New Bank (Optional - overrides dropdown)", value="", key="add_bank_new")
+                # --- END MODIFICATION 2 (UI) ---
 
                 txn_type = st.selectbox("Type", ["debit", "credit"])
                 amount = st.number_input("Amount (₹)", min_value=0.0, step=1.0, format="%.2f")
@@ -518,10 +515,18 @@ def main():
 
                 if submit_add:
                     try:
-                        if manual_bank:
-                            chosen_bank = bank_other.strip() if bank_other and bank_other.strip() else "Unknown"
-                        else:
+                        # --- MODIFICATION 2 (Logic) ---
+                        # Logic to prioritize the new_bank_input field
+                        new_bank_name = new_bank_input.strip()
+
+                        if new_bank_name:  # If the 'New Bank' field is filled, use it
+                            chosen_bank = new_bank_name
+                        else:  # Otherwise, use the dropdown
                             chosen_bank = chosen_bank_sel if chosen_bank_sel else "Unknown"
+
+                        if not chosen_bank:  # Final fallback
+                            chosen_bank = "Unknown"
+                        # --- END MODIFICATION 2 (Logic) ---
 
                         timestamp_str, timestamp_dt = build_timestamp_str_using_now(new_date)
 
@@ -537,7 +542,8 @@ def main():
                         }
 
                         if chosen_bank == "Unknown":
-                            st.info("Bank will be recorded as 'Unknown'. If you meant to add a custom name, check the 'Add new bank manually' box and submit again.")
+                            st.info("Bank will be recorded as 'Unknown'.")
+                        
                         res = io_mod.append_new_row(
                             spreadsheet_id=SHEET_ID,
                             range_name=APPEND_RANGE,
