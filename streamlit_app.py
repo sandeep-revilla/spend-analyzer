@@ -431,6 +431,13 @@ def main():
 
             keys_ordered = list(choice_map.keys())
             labels_ordered = [choice_map[k]["label"] for k in keys_ordered]
+
+            selected_labels = st.multiselect(
+               Selected rows will be marked,
+                options=labels_ordered,
+                default=[]
+            )
+
             selected_keys = []
             for lbl in selected_labels:
                 for k in keys_ordered:
