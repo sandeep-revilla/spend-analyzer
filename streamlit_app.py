@@ -171,13 +171,11 @@ def main():
     if not banks:
         banks = ["Unknown"]
 
-    if st.session_state.get("bank_options") is None:
-        st.session_state["bank_options"] = banks.copy()
-    else:
-        for b in banks:
-            if b not in st.session_state["bank_options"]:
-                st.session_state["bank_options"].append(b)
-        st.session_state["bank_options"] = sorted(list(set(st.session_state["bank_options"])))
+    # --- MODIFICATION 3 ---
+    # Always set the bank options to the *current* list of banks from the data.
+    # This ensures that banks with no visible rows (e.g., deleted) are removed from the filter.
+    st.session_state["bank_options"] = banks.copy()
+    # --- END MODIFICATION 3 ---
 
     sel_banks = st.sidebar.multiselect("Banks", options=st.session_state["bank_options"], default=st.session_state["bank_options"], key="bank_filter_sidebar")
 
@@ -433,7 +431,8 @@ def main():
             labels_ordered = [choice_map[k]["label"] for k in keys_ordered]
 
             selected_labels = st.multiselect(
-                "Selected rows will be",
+                # Restored original label
+                "Select rows to remove (soft-delete). Selected rows will be marked is_deleted = TRUE.",
                 options=labels_ordered,
                 default=[]
             )
@@ -499,6 +498,7 @@ def main():
             with st.form("add_row_form", clear_on_submit=True):
                 new_date = st.date_input("Date (picker)", value=datetime.utcnow().date())
 
+                # Use the session state list, which is now always up-to-date
                 add_bank_options = st.session_state["bank_options"].copy() if st.session_state.get("bank_options") else ["Unknown"]
                 add_bank_options = sorted(list(set(add_bank_options)))
 
@@ -553,6 +553,9 @@ def main():
                         )
 
                         if res.get("status") == "ok":
+                            # This part is still fine, it just adds the new bank to the
+                            # session state for the *current* run. The next refresh
+                            # will rebuild the list from data anyway.
                             if chosen_bank and chosen_bank not in st.session_state["bank_options"]:
                                 st.session_state["bank_options"].append(chosen_bank)
                                 st.session_state["bank_options"] = sorted(list(set(st.session_state["bank_options"])))
