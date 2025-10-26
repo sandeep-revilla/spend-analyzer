@@ -10,6 +10,13 @@ import math
 st.set_page_config(page_title="💳 Daily Spend Tracker", layout="wide")
 st.title("💳 Daily Spending")
 
+# --- NEW: Added Demo Data Warning ---
+st.warning(
+    "**Demo Mode:** This application is currently displaying sample data for demonstration "
+    "purposes only. The figures shown are not real."
+)
+# --- END NEW ---
+
 
 # --- Helper Function to Calculate Running Balance (from 0) ---
 def calculate_running_balance(df: pd.DataFrame) -> pd.DataFrame:
@@ -90,15 +97,15 @@ def main():
         )
         return
 
-    # ------------------ Session State ------------------
+    # ------------------ Session State (FIXED) ------------------
     if "reload_key" not in st.session_state:
         st.session_state.reload_key = 0
     if "last_refreshed" not in st.session_state:
         st.session_state.last_refreshed = None
     if "all_bank_options" not in st.session_state:
         st.session_state.all_bank_options = []
-    if "selected_banks_filter" not in st.session_state:
-        st.session_state.selected_banks_filter = []
+    # --- FIX: Removed faulty initialization of selected_banks_filter ---
+    # We will now set the default in the sidebar logic where 'banks_available' is known
 
 
     # ------------------ Helpers ------------------
@@ -207,7 +214,7 @@ def main():
         converted_df_with_balance = calculate_running_balance(converted_df)
     
 
-    # --- MODIFIED: Balance Display (shows absolute value for individual banks) ---
+    # --- Balance Display (Absolute values for individual banks) ---
     st.subheader("🏦 Current Balances")
 
     latest_balances_df = pd.DataFrame()
@@ -229,27 +236,21 @@ def main():
                 current_balance = row['Balance'] # This is the *real* signed balance
                 
                 if pd.notna(current_balance):
-                    # 1. Accumulate the *real* signed balance for the total
                     total_balance += current_balance 
-                    
-                    # 2. Get the absolute value *only for the display*
                     display_balance = abs(current_balance)
-                    
                     with balance_cols[i]:
-                        # 3. Show the absolute value for the individual bank
                         st.metric(f"{bank_name} Balance", f"₹{display_balance:,.0f}")
                 else:
                     with balance_cols[i]:
                         st.metric(f"{bank_name} Balance", "N/A")
 
-            # Show Total Balance (this is the *real* net total)
             with balance_cols[-1]:
                 st.metric("Total Balance", f"₹{total_balance:,.0f}", "All Accounts")
     else:
         st.info("Calculating balances... (or no data found)")
 
     st.markdown("---")
-    # --- END MODIFIED BALANCE SECTION ---
+    # --- END BALANCE SECTION ---
 
 
     # ------------------ Compute global daily totals ------------------
@@ -286,16 +287,17 @@ def main():
         chart_type = st.selectbox("Chart type", ["Daily line", "Monthly bars", "Top categories (Top-N)"], index=0)
         top_n = st.slider("Top-N categories", 3, 20, 5, key="top_n")
 
-    # --- Expander 2: Transaction Filters ---
+    # --- Expander 2: Transaction Filters (FIXED DEFAULT) ---
     with st.sidebar.expander("🔍 Transaction Filters", expanded=True):
         
+        # --- FIX: This logic now correctly sets the default on first run ---
         if "selected_banks_filter" not in st.session_state:
             st.session_state.selected_banks_filter = banks_available.copy()
 
         sel_banks = st.multiselect(
             "Banks", 
             options=banks_available, 
-            key="selected_banks_filter"
+            key="selected_banks_filter" # This key links to the persistent (and now default-full) list
         )
         
         totals_mode = st.radio("Totals mode", ["Single date", "Date range"], index=0)
@@ -447,12 +449,13 @@ def main():
             unsafe_allow_html=True,
         )
 
-    # ------------------ Charts (MODIFIED) ------------------
+    # ------------------ Charts ------------------
     st.subheader("📊 Charts")
     if charts_mod is None:
         st.info("charts.py module is not available.")
     elif merged.empty:
-        st.info("No data available for the selected chart filters.")
+        # This message now appears if the bank filter is empty
+        st.info("No data available for the selected chart filters. Please select one or more banks in the sidebar.")
     else:
         series_selected = []
         if show_debit:
@@ -460,7 +463,6 @@ def main():
         if show_credit:
             series_selected.append("Total_Credit")
         
-        # --- FIX: Added check for empty series ---
         if not series_selected:
             st.info("No chart series selected. Please check 'Show Debit' or 'Show Credit' in the sidebar.")
         else:
@@ -470,12 +472,11 @@ def main():
                 st.error("Chart rendering failed. See traceback below.")
                 st.exception(e)
                 st.text(traceback.format_exc())
-    # --- END MODIFIED CHARTS ---
 
 
     # ------------------ Rows Table ------------------
     st.subheader("Rows (matching selection)")
-    rows_df = sel_df.copy() # Use the date-filtered dataframe
+    rows_df = sel_df.copy()
 
     _desired = ['timestamp', 'bank', 'type', 'amount', 'balance', 'message']
     col_map = {c.lower(): c for c in rows_df.columns}
