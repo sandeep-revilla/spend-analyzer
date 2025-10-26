@@ -2,12 +2,55 @@
 import streamlit as st
 import pandas as pd
 import importlib
-from datetime import datetime, date
+from datetime import datetime, date, time as dt_time, timedelta
 import traceback
 from typing import Optional
+import math
 
 st.set_page_config(page_title="💳 Daily Spend Tracker", layout="wide")
 st.title("💳 Daily Spending")
+
+
+# --- NEW: Helper Function to Calculate Running Balance (from 0) ---
+def calculate_running_balance(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculates a running balance in-memory, assuming a starting balance of 0
+    for each bank before its first transaction.
+    """
+    df = df.copy()
+    
+    # Ensure a valid timestamp column exists
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+    elif 'date' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['date'], errors='coerce')
+    else:
+        df['timestamp'] = pd.NaT # No date, can't balance
+
+    df = df.dropna(subset=['timestamp'])
+    if df.empty:
+        df['Balance'] = pd.NA
+        return df
+
+    # Ensure essential columns are numeric/clean
+    df['Amount'] = pd.to_numeric(df.get('Amount'), errors='coerce').fillna(0.0)
+    df['Type_norm'] = df.get('Type', 'debit').astype(str).str.lower()
+    df['Bank'] = df.get('Bank', 'Unknown').astype(str).str.strip()
+
+    # Create a 'signed' amount for credits (+) and debits (-)
+    df['Signed_Amount'] = df.apply(
+        lambda r: r['Amount'] if r['Type_norm'] == 'credit' else -r['Amount'],
+        axis=1
+    )
+    
+    # Sort by bank, then time, to ensure the cumsum is in the correct order
+    df = df.sort_values(by=['Bank', 'timestamp'])
+    
+    # The running balance is the cumulative sum, grouped by bank
+    df['Balance'] = df.groupby('Bank')['Signed_Amount'].cumsum()
+    
+    return df
+# --- END NEW FUNCTION ---
 
 
 def main():
@@ -52,8 +95,13 @@ def main():
         st.session_state.reload_key = 0
     if "last_refreshed" not in st.session_state:
         st.session_state.last_refreshed = None
-    if "bank_options" not in st.session_state:
-        st.session_state["bank_options"] = None
+    # FIX: 'all_bank_options' stores the list of available banks
+    # 'selected_banks_filter' stores the user's selection
+    if "all_bank_options" not in st.session_state:
+        st.session_state.all_bank_options = []
+    if "selected_banks_filter" not in st.session_state:
+        st.session_state.selected_banks_filter = []
+
 
     # ------------------ Helpers ------------------
     def _get_creds_info():
@@ -79,7 +127,8 @@ def main():
         df["_source_sheet"] = source_name
         return df
 
-    @st.cache_data(ttl=3, show_spinner=False)
+    # --- FIX: Changed ttl from 3 to 300 seconds (5 minutes) ---
+    @st.cache_data(ttl=300, show_spinner=False)
     def fetch_sheets(spreadsheet_id, range_hist, range_append, creds_info, reload_key):
         hist_df = _read_sheet_with_index(spreadsheet_id, range_hist, "history", creds_info)
         app_df = _read_sheet_with_index(spreadsheet_id, range_append, "append", creds_info)
@@ -91,8 +140,8 @@ def main():
         """
         <style>
          div[data-testid="stSidebar"] button[data-testid="stButton"] {
-           background-color: #2ecc71;
-           color: white;
+            background-color: #2ecc71;
+            color: white;
          }
         </style>
         """,
@@ -100,7 +149,7 @@ def main():
     )
     if st.sidebar.button("🔁 Refresh Data", use_container_width=True, key="refresh_button"):
         st.session_state.reload_key += 1
-        st.experimental_rerun()
+        st.rerun() # --- FIX: Replaced st.experimental_rerun() ---
 
     if st.session_state.last_refreshed:
         st.caption(f"Last refreshed: {st.session_state.last_refreshed.strftime('%Y-%m-%d %H:%M:%S UTC')}")
@@ -157,51 +206,140 @@ def main():
     if "Bank" not in converted_df.columns:
         converted_df["Bank"] = "Unknown"
 
+    # --- NEW: Calculate running balance ---
+    with st.spinner("Calculating running balances..."):
+        converted_df_with_balance = calculate_running_balance(converted_df)
+    # --- END NEW ---
+    
+
+    # --- NEW: Balance Display (shows the *latest* balance) ---
+    st.subheader("🏦 Current Balances")
+
+    latest_balances_df = pd.DataFrame()
+    if not converted_df_with_balance.empty and 'timestamp' in converted_df_with_balance.columns and not converted_df_with_balance['timestamp'].isnull().all():
+        latest_balances_df = converted_df_with_balance.loc[
+            converted_df_with_balance.groupby('Bank')['timestamp'].idxmax(skipna=True)
+        ]
+
+    total_balance = 0.0
+    if not latest_balances_df.empty and 'Balance' in latest_balances_df.columns:
+        banks_to_show = sorted(latest_balances_df['Bank'].unique())
+        if not banks_to_show:
+             st.info("No bank data found to calculate balances.")
+        else:
+            balance_cols = st.columns(len(banks_to_show) + 1)
+            
+            for i, bank_name in enumerate(banks_to_show):
+                row = latest_balances_df[latest_balances_df['Bank'] == bank_name].iloc[0]
+                current_balance = row['Balance']
+                
+                if pd.notna(current_balance):
+                    total_balance += current_balance
+                    with balance_cols[i]:
+                        st.metric(f"{bank_name} Balance", f"₹{current_balance:,.0f}")
+                else:
+                    with balance_cols[i]:
+                        st.metric(f"{bank_name} Balance", "N/A")
+
+            # Show Total Balance
+            with balance_cols[-1]:
+                st.metric("Total Balance", f"₹{total_balance:,.0f}", "All Accounts")
+    else:
+        st.info("Calculating balances... (or no data found)")
+
+    st.markdown("---")
+    # --- END NEW BALANCE SECTION ---
+
+
     # ------------------ Compute global daily totals ------------------
     try:
-        merged_all = transform.compute_daily_totals(converted_df.copy())
+        merged_all = transform.compute_daily_totals(converted_df_with_balance.copy())
         if not merged_all.empty:
             merged_all["Date"] = pd.to_datetime(merged_all["Date"]).dt.normalize()
     except Exception:
         merged_all = pd.DataFrame()
 
-    # ------------------ Sidebar Filters ------------------
+    # ------------------ Sidebar Filters (RE-GROUPED) ------------------
     st.sidebar.header("Filters")
-    banks = sorted([b for b in converted_df["Bank"].dropna().unique().tolist()])
-    if not banks:
-        banks = ["Unknown"]
+    
+    # Get all available banks for filter options
+    banks_available = sorted([b for b in converted_df_with_balance["Bank"].dropna().unique().tolist()])
+    if not banks_available:
+        banks_available = ["Unknown"]
+    
+    # Store this list in session state for the 'Add Row' form
+    st.session_state.all_bank_options = banks_available.copy()
 
-    # --- MODIFICATION 3 ---
-    # Always set the bank options to the *current* list of banks from the data.
-    # This ensures that banks with no visible rows (e.g., deleted) are removed from the filter.
-    st.session_state["bank_options"] = banks.copy()
-    # --- END MODIFICATION 3 ---
+    # --- Expander 1: Chart & Metric Options ---
+    with st.sidebar.expander("📊 Chart & Metric Options", expanded=False):
+        ts_valid = converted_df_with_balance["timestamp"].dropna()
+        years = sorted(ts_valid.dt.year.unique().tolist(), reverse=True) if not ts_valid.empty else []
+        year_options = ["All"] + [str(y) for y in years]
+        sel_year = st.selectbox("Year (for monthly average)", options=year_options, index=0)
 
-    sel_banks = st.sidebar.multiselect("Banks", options=st.session_state["bank_options"], default=st.session_state["bank_options"], key="bank_filter_sidebar")
+        month_map = {i: pd.Timestamp(1900, i, 1).strftime("%B") for i in range(1, 13)}
+        month_options = ["All"] + [month_map[i] for i in range(1, 13)]
+        sel_month_name = st.selectbox("Month (for monthly average)", options=month_options, index=0)
 
-    ts_valid = converted_df["timestamp"].dropna()
-    years = sorted(ts_valid.dt.year.unique().tolist(), reverse=True) if not ts_valid.empty else []
-    year_options = ["All"] + [str(y) for y in years]
-    sel_year = st.sidebar.selectbox("Year (for monthly average)", options=year_options, index=0)
+        exclude_outliers = st.checkbox("Exclude outliers from average", value=False, key="exclude_outliers")
+        show_debit = st.checkbox("Show Debit (Total_Spent)", value=True, key="show_debit")
+        show_credit = st.checkbox("Show Credit (Total_Credit)", value=False, key="show_credit")
+        chart_type = st.selectbox("Chart type", ["Daily line", "Monthly bars", "Top categories (Top-N)"], index=0)
+        top_n = st.slider("Top-N categories", 3, 20, 5, key="top_n")
 
-    month_map = {i: pd.Timestamp(1900, i, 1).strftime("%B") for i in range(1, 13)}
-    month_options = ["All"] + [month_map[i] for i in range(1, 13)]
-    sel_month_name = st.sidebar.selectbox("Month (for monthly average)", options=month_options, index=0)
+    # --- Expander 2: Transaction Filters ---
+    with st.sidebar.expander("🔍 Transaction Filters", expanded=True):
+        
+        # --- FIX: Set default selection only on the first run ---
+        if "selected_banks_filter" not in st.session_state:
+            st.session_state.selected_banks_filter = banks_available.copy()
 
-    exclude_outliers = st.sidebar.checkbox("Exclude outliers from average", value=False, key="exclude_outliers")
-    show_debit = st.sidebar.checkbox("Show Debit (Total_Spent)", value=True, key="show_debit")
-    show_credit = st.sidebar.checkbox("Show Credit (Total_Credit)", value=False, key="show_credit")
-    chart_type = st.sidebar.selectbox("Chart type", ["Daily line", "Monthly bars", "Top categories (Top-N)"], index=0)
-    top_n = st.sidebar.slider("Top-N categories", 3, 20, 5, key="top_n")
-    totals_mode = st.sidebar.radio("Totals mode", ["Single date", "Date range"], index=0)
+        sel_banks = st.multiselect(
+            "Banks", 
+            options=banks_available, 
+            key="selected_banks_filter" # This key links to the persistent selection
+        )
+        
+        totals_mode = st.radio("Totals mode", ["Single date", "Date range"], index=0)
+
+        # --- Date Range (for rows & totals) ---
+        valid_dates_all = converted_df_with_balance["timestamp"].dropna()
+        if valid_dates_all.empty:
+            st.warning("No valid dates found in data.")
+            min_date, max_date = date.today() - timedelta(days=30), date.today()
+        else:
+            min_date, max_date = valid_dates_all.min().date(), valid_dates_all.max().date()
+
+        if min_date > max_date:
+            min_date, max_date = max_date, min_date
+        
+        today = datetime.utcnow().date()
+        default_sel_date = min(max(today, min_date), max_date) # Default to today, clamped within range
+
+        if totals_mode == "Single date":
+            sel_date = st.date_input("Pick date", value=default_sel_date, min_value=min_date, max_value=max_date)
+            start_sel, end_sel = sel_date, sel_date
+        else:
+            default_start = min_date
+            default_end = max_date
+            dr = st.date_input("Pick date range", value=(default_start, default_end), min_value=min_date, max_value=max_date)
+            if isinstance(dr, (tuple, list)) and len(dr) == 2:
+                start_sel, end_sel = dr
+            else:
+                start_sel, end_sel = dr, dr # Fallback if only one date is picked
+            
+            if start_sel > end_sel:
+                start_sel, end_sel = end_sel, start_sel
+    
 
     # ------------------ Apply Filters ------------------
-    filtered_df = converted_df[converted_df["Bank"].isin(sel_banks)].copy()
+    # Use the 'Balance' inclusive dataframe
+    filtered_df = converted_df_with_balance[converted_df_with_balance["Bank"].isin(sel_banks)].copy()
 
     # compute filtered daily totals for charts
     with st.spinner("Computing daily totals..."):
         try:
-            merged = transform.compute_daily_totals(filtered_df)
+            merged = transform.compute_daily_totals(filtered_df.copy())
         except Exception as e:
             st.error("Error in compute_daily_totals(). See traceback below.")
             st.exception(e)
@@ -211,44 +349,11 @@ def main():
     if not merged.empty:
         merged["Date"] = pd.to_datetime(merged["Date"]).dt.normalize()
 
-    # ------------------ Date Range (for rows & totals) ------------------
-    valid_dates = filtered_df["timestamp"].dropna()
-    if valid_dates.empty:
-        st.warning("No valid dates found.")
-        return
-
-    min_date, max_date = valid_dates.min().date(), valid_dates.max().date()
-    today = datetime.utcnow().date()
-    if min_date > max_date:
-        min_date, max_date = max_date, min_date
-
-    default_sel_date = today
-    if default_sel_date < min_date:
-        default_sel_date = min_date
-    if default_sel_date > max_date:
-        default_sel_date = max_date
-
-    if totals_mode == "Single date":
-        sel_date = st.sidebar.date_input("Pick date", value=default_sel_date, min_value=min_date, max_value=max_date)
-        start_sel, end_sel = sel_date, sel_date
-    else:
-        start_def, end_def = min_date, max_date
-        if start_def < min_date:
-            start_def = min_date
-        if end_def > max_date:
-            end_def = max_date
-        if start_def > end_def:
-            start_def = end_def
-        dr = st.sidebar.date_input("Pick date range", value=(start_def, end_def), min_value=min_date, max_value=max_date)
-        if isinstance(dr, (tuple, list)) and len(dr) == 2:
-            start_sel, end_sel = dr
-        else:
-            start_sel, end_sel = dr, dr
 
     # ------------------ Compute totals for selected date/range ------------------
     tmp = filtered_df.copy()
     mask = tmp["timestamp"].dt.date.between(start_sel, end_sel)
-    sel_df = tmp.loc[mask]
+    sel_df = tmp.loc[mask] # This is the final filtered DF for table + totals
 
     amt_col = next((c for c in sel_df.columns if c.lower() == "amount"), None)
     type_col = next((c for c in sel_df.columns if c.lower() == "type"), None)
@@ -318,48 +423,26 @@ def main():
         except Exception:
             metric_avg = prev_avg = None
 
-    # ------------------ Top-right compact metric (dynamic title like "oct AVG spent") ------------------
+    # ------------------ Top-right compact metric ------------------
     top_left, top_mid, top_right = st.columns([6, 2, 2])
     with top_right:
-        # --- MODIFICATION 1 ---
-        # Simplified title to remove the redundant month
         title_small = "AVG spent"
-        # --- END MODIFICATION 1 ---
-
-        if metric_avg is None:
-            metric_text = "N/A"
-        else:
-            metric_text = f"₹{metric_avg:,.2f}"
+        metric_text = f"₹{metric_avg:,.2f}" if metric_avg is not None else "N/A"
 
         if prev_avg is None or metric_avg is None:
-            delta_html = f"<div style='text-align:right; color:gray; font-weight:600'>N/A</div>"
+            delta_html = "<div style='text-align:right; color:gray; font-weight:600'>N/A</div>"
         else:
             diff = metric_avg - prev_avg
             try:
-                if abs(prev_avg) > 1e-9:
-                    pct = (diff / abs(prev_avg)) * 100.0
-                    delta_label = f"{pct:+.1f}%"
-                else:
-                    delta_label = f"{diff:+.2f}"
+                delta_label = f"{(diff / abs(prev_avg) * 100.0):+.1f}%" if abs(prev_avg) > 1e-9 else f"{diff:+.2f}"
             except Exception:
                 delta_label = f"{diff:+.2f}"
-
-            if diff > 0:
-                color = "red"
-                arrow = "▲"
-            elif diff < 0:
-                color = "green"
-                arrow = "▼"
-            else:
-                color = "gray"
-                arrow = "►"
-
+            
+            color = "red" if diff > 0 else ("green" if diff < 0 else "gray")
+            arrow = "▲" if diff > 0 else ("▼" if diff < 0 else "►")
             delta_html = f"<div style='text-align:right; color:{color}; font-weight:700'>{arrow} {delta_label}</div>"
 
-        if metric_year and metric_month:
-            month_label_display = pd.Timestamp(metric_year, metric_month, 1).strftime("%b-%y")
-        else:
-            month_label_display = "—"
+        month_label_display = pd.Timestamp(metric_year, metric_month, 1).strftime("%b-%y") if metric_year and metric_month else "—"
 
         st.markdown(
             "<div style='text-align:right'>"
@@ -386,18 +469,60 @@ def main():
             st.exception(e)
             st.text(traceback.format_exc())
     else:
-        st.info("No data for charts.")
+        st.info("No data for charts (or charts.py is missing).")
 
-    # ------------------ Rows Table ------------------
+    # ------------------ Rows Table (MODIFIED) ------------------
     st.subheader("Rows (matching selection)")
-    rows_df = filtered_df.copy()
-    mask = rows_df["timestamp"].dt.date.between(start_sel, end_sel)
-    rows_df = rows_df.loc[mask]
+    rows_df = sel_df.copy() # Use the date-filtered dataframe
 
-    display_cols = [c for c in ["timestamp", "Bank", "Type", "Amount", "Message"] if c in rows_df.columns]
-    st.dataframe(rows_df[display_cols], use_container_width=True, height=420)
+    _desired = ['timestamp', 'bank', 'type', 'amount', 'balance', 'message'] # Added 'balance'
+    col_map = {c.lower(): c for c in rows_df.columns}
+    display_cols = [col_map[d] for d in _desired if d in col_map]
+    
+    if not any(c.lower() == 'timestamp' for c in display_cols) and 'date' in col_map: 
+        display_cols.insert(0, col_map['date'])
 
-    csv_data = rows_df.to_csv(index=False).encode("utf-8")
+    if not display_cols: # Fallback
+        st.warning("Could not find preferred columns - showing raw data."); 
+        display_df = rows_df
+    else:
+        display_df = rows_df[display_cols].copy()
+        
+        # Formatting
+        ts_col = next((c for c in display_df.columns if c.lower() in ['timestamp', 'date']), None)
+        if ts_col: display_df[ts_col] = pd.to_datetime(display_df[ts_col], errors='coerce').dt.strftime('%Y-%m-%d %H:%M').fillna('')
+        
+        amt_col = next((c for c in display_df.columns if c.lower() == 'amount'), None)
+        if amt_col: display_df[amt_col] = pd.to_numeric(display_df[amt_col], errors='coerce')
+        
+        bal_col = next((c for c in display_df.columns if c.lower() == 'balance'), None)
+        if bal_col: display_df[bal_col] = pd.to_numeric(display_df[bal_col], errors='coerce')
+
+        pretty_rename = {
+            'timestamp':'Timestamp','date':'Timestamp','bank':'Bank','type':'Type',
+            'amount':'Amount','balance':'Balance','message':'Message'
+        }
+        display_df = display_df.rename(columns={c:pretty_rename[c.lower()] for c in display_df.columns if c.lower() in pretty_rename})
+        
+        final_order = [c for c in ['Timestamp', 'Bank', 'Type', 'Amount', 'Balance', 'Message'] if c in display_df.columns]
+        display_df = display_df[final_order]
+
+    # Sort by timestamp descending for display
+    if 'Timestamp' in display_df.columns:
+        display_df = display_df.sort_values(by='Timestamp', ascending=False)
+
+    st.dataframe(
+        display_df.reset_index(drop=True), 
+        use_container_width=True, 
+        height=420,
+        column_config={
+            "Amount": st.column_config.NumberColumn(format="₹%.2f"),
+            "Balance": st.column_config.NumberColumn(format="₹%.0f") # Format balance
+        }
+    )
+    # --- END MODIFIED TABLE ---
+
+    csv_data = display_df.to_csv(index=False).encode("utf-8")
     st.download_button("📥 Download CSV", csv_data, "transactions.csv", "text/csv")
 
     # ------------------ Remove Rows UI (soft delete) ------------------
@@ -407,6 +532,7 @@ def main():
     if io_mod is None:
         st.info("Write operations (including remove) are disabled because io_helpers failed to import.")
     else:
+        # Use rows_df, which is already filtered by bank + date
         if "_sheet_row_idx" not in rows_df.columns or "_source_sheet" not in rows_df.columns:
             st.error("Missing internal row mapping columns ('_sheet_row_idx' or '_source_sheet'). Cannot delete rows.")
             st.info("These columns are normally added automatically when reading Google Sheets. Ensure io_helpers.read_google_sheet is used.")
@@ -431,7 +557,6 @@ def main():
             labels_ordered = [choice_map[k]["label"] for k in keys_ordered]
 
             selected_labels = st.multiselect(
-                # Restored original label
                 "Selected rows will be marked deleted",
                 options=labels_ordered,
                 default=[]
@@ -478,9 +603,9 @@ def main():
                     else:
                         st.success(f"Marked {overall_updated} rows as deleted.")
                         st.session_state.reload_key += 1
-                        st.experimental_rerun()
+                        st.rerun() # --- FIX: Replaced st.experimental_rerun() ---
 
-    # ------------------ Add New Row (always-show text input but disabled until checkbox checked) ------------------
+    # ------------------ Add New Row ------------------
     st.markdown("---")
     st.write("➕ Add a new transaction")
 
@@ -498,15 +623,12 @@ def main():
             with st.form("add_row_form", clear_on_submit=True):
                 new_date = st.date_input("Date (picker)", value=datetime.utcnow().date())
 
-                # Use the session state list, which is now always up-to-date
-                add_bank_options = st.session_state["bank_options"].copy() if st.session_state.get("bank_options") else ["Unknown"]
+                # --- FIX: Use the 'all_bank_options' list from session state ---
+                add_bank_options = st.session_state.all_bank_options.copy()
                 add_bank_options = sorted(list(set(add_bank_options)))
 
-                # --- MODIFICATION 2 (UI) ---
-                # Replaced checkbox/disabled text_input with selectbox + optional text_input
                 chosen_bank_sel = st.selectbox("Bank (from existing)", options=add_bank_options, index=0, key="add_bank_select")
                 new_bank_input = st.text_input("New Bank (Optional - overrides dropdown)", value="", key="add_bank_new")
-                # --- END MODIFICATION 2 (UI) ---
 
                 txn_type = st.selectbox("Type", ["debit", "credit"])
                 amount = st.number_input("Amount (₹)", min_value=0.0, step=1.0, format="%.2f")
@@ -515,18 +637,10 @@ def main():
 
                 if submit_add:
                     try:
-                        # --- MODIFICATION 2 (Logic) ---
-                        # Logic to prioritize the new_bank_input field
                         new_bank_name = new_bank_input.strip()
-
-                        if new_bank_name:  # If the 'New Bank' field is filled, use it
-                            chosen_bank = new_bank_name
-                        else:  # Otherwise, use the dropdown
-                            chosen_bank = chosen_bank_sel if chosen_bank_sel else "Unknown"
-
-                        if not chosen_bank:  # Final fallback
+                        chosen_bank = new_bank_name if new_bank_name else (chosen_bank_sel if chosen_bank_sel else "Unknown")
+                        if not chosen_bank:
                             chosen_bank = "Unknown"
-                        # --- END MODIFICATION 2 (Logic) ---
 
                         timestamp_str, timestamp_dt = build_timestamp_str_using_now(new_date)
 
@@ -540,9 +654,6 @@ def main():
                             "Message": msg,
                             "is_deleted": "false",
                         }
-
-                        if chosen_bank == "Unknown":
-                            st.info("Bank will be recorded as 'Unknown'.")
                         
                         res = io_mod.append_new_row(
                             spreadsheet_id=SHEET_ID,
@@ -553,15 +664,12 @@ def main():
                         )
 
                         if res.get("status") == "ok":
-                            # This part is still fine, it just adds the new bank to the
-                            # session state for the *current* run. The next refresh
-                            # will rebuild the list from data anyway.
-                            if chosen_bank and chosen_bank not in st.session_state["bank_options"]:
-                                st.session_state["bank_options"].append(chosen_bank)
-                                st.session_state["bank_options"] = sorted(list(set(st.session_state["bank_options"])))
-                            st.success("✅ Row added successfully with correct date & time!")
+                            st.success("✅ Row added successfully!")
                             st.session_state.reload_key += 1
-                            st.experimental_rerun()
+                            # Clear selection cache to default to all (including new bank)
+                            if "selected_banks_filter" in st.session_state:
+                                del st.session_state.selected_banks_filter
+                            st.rerun() # --- FIX: Replaced st.experimental_rerun() ---
                         else:
                             st.error(f"Failed to add row: {res}")
                     except Exception as e:
