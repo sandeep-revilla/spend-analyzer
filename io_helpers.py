@@ -395,9 +395,21 @@ def mark_rows_deleted(spreadsheet_id: str, range_name: str,
     return {"status": "ok", "updated": updated}
 
 
+# --- NEW: Security helper to prevent Formula Injection ---
+def _sanitize_for_formula_injection(s: str) -> str:
+    """
+    Prepends a single quote to strings that start with formula-like characters
+    ('=', '+', '-', '@') to force Google Sheets to treat them as plain text.
+    """
+    if s.startswith(('=', '+', '-', '@')):
+        return "'" + s
+    return s
+# --- END NEW ---
+
+
 def append_new_row(spreadsheet_id: str, range_name: str, new_row_dict: Dict[str, Any],
-                   creds_info: Optional[Dict] = None, creds_file: Optional[str] = None,
-                   history_range: Optional[str] = None) -> Dict:
+                  creds_info: Optional[Dict] = None, creds_file: Optional[str] = None,
+                  history_range: Optional[str] = None) -> Dict:
     """
     Append a new row to the sheet (Append sheet). Optionally synchronize headers with History sheet
     before appending by providing history_range (sheet/tab name or A1-range for history header).
@@ -435,10 +447,10 @@ def append_new_row(spreadsheet_id: str, range_name: str, new_row_dict: Dict[str,
     if history_range:
         try:
             ensure_res = ensure_sheet_headers_match(spreadsheet_id=spreadsheet_id,
-                                                   history_range=history_range,
-                                                   append_range=range_name,
-                                                   creds_info=creds_info,
-                                                   creds_file=creds_file)
+                                                  history_range=history_range,
+                                                  append_range=range_name,
+                                                  creds_info=creds_info,
+                                                  creds_file=creds_file)
             if ensure_res.get("status") != "ok":
                 return {"status": "error", "message": f"Failed to ensure headers match: {ensure_res.get('message')}"}
         except Exception as e:
@@ -556,11 +568,14 @@ def append_new_row(spreadsheet_id: str, range_name: str, new_row_dict: Dict[str,
             row_out.append(v)
             continue
 
-        # Strings -> strip and keep
+        # --- MODIFIED: Added sanitization for strings ---
         if isinstance(v, str):
             s = v.strip()
-            row_out.append(s)
+            # SECURITY FIX: Sanitize to prevent formula injection
+            s_sanitized = _sanitize_for_formula_injection(s)
+            row_out.append(s_sanitized)
             continue
+        # --- END MODIFICATION ---
 
         # Fallback: attempt isoformat or str()
         try:
