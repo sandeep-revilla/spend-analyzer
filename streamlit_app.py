@@ -1,4 +1,4 @@
-# streamlit_app.py — Complete Daily Spend Tracker (Google Sheets + Charts + Add Row + Remove Row)
+# streamlit_app.py — Complete Daily Spend Tracker (Google Sheets + Charts + Remove Row)
 import streamlit as st
 import pandas as pd
 import importlib
@@ -100,8 +100,7 @@ def main():
         st.session_state.reload_key = 0
     if "last_refreshed" not in st.session_state:
         st.session_state.last_refreshed = None
-    if "all_bank_options" not in st.session_state:
-        st.session_state.all_bank_options = []
+    # --- REMOVED 'all_bank_options' ---
 
 
     # ------------------ Helpers (SECURED) ------------------
@@ -267,7 +266,7 @@ def main():
     if not banks_available:
         banks_available = ["Unknown"]
     
-    st.session_state.all_bank_options = banks_available.copy()
+    # --- REMOVED 'all_bank_options' ---
 
     # --- Expander 1: Chart & Metric Options ---
     with st.sidebar.expander("📊 Chart & Metric Options", expanded=False):
@@ -607,77 +606,8 @@ def main():
                         st.session_state.reload_key += 1
                         st.rerun()
 
-    # ------------------ Add New Row (SECURED) ------------------
-    st.markdown("---")
-    st.write("➕ Add a new transaction")
+    # ------------------ ADD ROW SECTION REMOVED ------------------
 
-    def build_timestamp_str_using_now(chosen_date: date):
-        now = datetime.utcnow()
-        try:
-            dt_combined = datetime.combine(chosen_date, now.time())
-        except Exception:
-            dt_combined = now
-        formatted = dt_combined.strftime("%m/%d/%Y %H:%M")
-        return formatted, dt_combined
-
-    if io_mod is not None:
-        with st.expander("Add new row"):
-            with st.form("add_row_form", clear_on_submit=True):
-                new_date = st.date_input("Date (picker)", value=datetime.utcnow().date())
-                
-                add_bank_options = st.session_state.all_bank_options.copy()
-                add_bank_options = sorted(list(set(add_bank_options)))
-
-                chosen_bank_sel = st.selectbox("Bank (from existing)", options=add_bank_options, index=0, key="add_bank_select")
-                new_bank_input = st.text_input("New Bank (Optional - overrides dropdown)", value="", key="add_bank_new")
-
-                txn_type = st.selectbox("Type", ["debit", "credit"])
-                amount = st.number_input("Amount (₹)", min_value=0.0, step=1.0, format="%.2f")
-                msg = st.text_input("Message / Description", "")
-                submit_add = st.form_submit_button("Save new row")
-
-                if submit_add:
-                    try:
-                        new_bank_name = new_bank_input.strip()
-                        chosen_bank = new_bank_name if new_bank_name else (chosen_bank_sel if chosen_bank_sel else "Unknown")
-                        if not chosen_bank:
-                            chosen_bank = "Unknown"
-
-                        timestamp_str, timestamp_dt = build_timestamp_str_using_now(new_date)
-
-                        new_row = {
-                            "DateTime": timestamp_str,
-                            "timestamp": timestamp_dt,
-                            "date": timestamp_dt.strftime("%m/%d/%Y %H:%M"),
-                            "Bank": chosen_bank,
-                            "Type": txn_type,
-                            "Amount": amount,
-                            "Message": msg, # Sanitization is handled by io_helpers.py
-                            "is_deleted": "false",
-                        }
-                        
-                        res = io_mod.append_new_row(
-                            spreadsheet_id=SHEET_ID,
-                            range_name=APPEND_RANGE,
-                            new_row_dict=new_row,
-                            creds_info=creds_info,
-                            history_range=RANGE,
-                        )
-
-                        if res.get("status") == "ok":
-                            st.success("✅ Row added successfully!")
-                            st.session_state.reload_key += 1
-                            if "selected_banks_filter" in st.session_state:
-                                del st.session_state.selected_banks_filter
-                            st.rerun()
-                        else:
-                            st.error(f"Failed to add row: {res}")
-                    except Exception as e:
-                        # --- MODIFIED: Removed stack trace from UI ---
-                        st.error("Error adding row. Check logs for details.")
-                        print(f"Error adding row: {e}\n{traceback.format_exc()}") # Logs for developer
-    else:
-        st.info("Write operations disabled: io_helpers module unavailable.")
 
     # ------------------ Summary (Selected date/range) ------------------
     st.markdown("---")
