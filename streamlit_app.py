@@ -11,7 +11,7 @@ st.set_page_config(page_title="💳 Daily Spend Tracker", layout="wide")
 st.title("💳 Daily Spending")
 
 
-# --- NEW: Helper Function to Calculate Running Balance (from 0) ---
+# --- Helper Function to Calculate Running Balance (from 0) ---
 def calculate_running_balance(df: pd.DataFrame) -> pd.DataFrame:
     """
     Calculates a running balance in-memory, assuming a starting balance of 0
@@ -50,7 +50,7 @@ def calculate_running_balance(df: pd.DataFrame) -> pd.DataFrame:
     df['Balance'] = df.groupby('Bank')['Signed_Amount'].cumsum()
     
     return df
-# --- END NEW FUNCTION ---
+# --- END HELPER FUNCTION ---
 
 
 def main():
@@ -95,8 +95,6 @@ def main():
         st.session_state.reload_key = 0
     if "last_refreshed" not in st.session_state:
         st.session_state.last_refreshed = None
-    # FIX: 'all_bank_options' stores the list of available banks
-    # 'selected_banks_filter' stores the user's selection
     if "all_bank_options" not in st.session_state:
         st.session_state.all_bank_options = []
     if "selected_banks_filter" not in st.session_state:
@@ -127,7 +125,6 @@ def main():
         df["_source_sheet"] = source_name
         return df
 
-    # --- FIX: Changed ttl from 3 to 300 seconds (5 minutes) ---
     @st.cache_data(ttl=300, show_spinner=False)
     def fetch_sheets(spreadsheet_id, range_hist, range_append, creds_info, reload_key):
         hist_df = _read_sheet_with_index(spreadsheet_id, range_hist, "history", creds_info)
@@ -149,7 +146,7 @@ def main():
     )
     if st.sidebar.button("🔁 Refresh Data", use_container_width=True, key="refresh_button"):
         st.session_state.reload_key += 1
-        st.rerun() # --- FIX: Replaced st.experimental_rerun() ---
+        st.rerun()
 
     if st.session_state.last_refreshed:
         st.caption(f"Last refreshed: {st.session_state.last_refreshed.strftime('%Y-%m-%d %H:%M:%S UTC')}")
@@ -206,13 +203,11 @@ def main():
     if "Bank" not in converted_df.columns:
         converted_df["Bank"] = "Unknown"
 
-    # --- NEW: Calculate running balance ---
     with st.spinner("Calculating running balances..."):
         converted_df_with_balance = calculate_running_balance(converted_df)
-    # --- END NEW ---
     
 
-    # --- NEW: Balance Display (shows the *latest* balance) ---
+    # --- MODIFIED: Balance Display (shows absolute value for individual banks) ---
     st.subheader("🏦 Current Balances")
 
     latest_balances_df = pd.DataFrame()
@@ -231,24 +226,30 @@ def main():
             
             for i, bank_name in enumerate(banks_to_show):
                 row = latest_balances_df[latest_balances_df['Bank'] == bank_name].iloc[0]
-                current_balance = row['Balance']
+                current_balance = row['Balance'] # This is the *real* signed balance
                 
                 if pd.notna(current_balance):
-                    total_balance += current_balance
+                    # 1. Accumulate the *real* signed balance for the total
+                    total_balance += current_balance 
+                    
+                    # 2. Get the absolute value *only for the display*
+                    display_balance = abs(current_balance)
+                    
                     with balance_cols[i]:
-                        st.metric(f"{bank_name} Balance", f"₹{current_balance:,.0f}")
+                        # 3. Show the absolute value for the individual bank
+                        st.metric(f"{bank_name} Balance", f"₹{display_balance:,.0f}")
                 else:
                     with balance_cols[i]:
                         st.metric(f"{bank_name} Balance", "N/A")
 
-            # Show Total Balance
+            # Show Total Balance (this is the *real* net total)
             with balance_cols[-1]:
                 st.metric("Total Balance", f"₹{total_balance:,.0f}", "All Accounts")
     else:
         st.info("Calculating balances... (or no data found)")
 
     st.markdown("---")
-    # --- END NEW BALANCE SECTION ---
+    # --- END MODIFIED BALANCE SECTION ---
 
 
     # ------------------ Compute global daily totals ------------------
@@ -259,15 +260,13 @@ def main():
     except Exception:
         merged_all = pd.DataFrame()
 
-    # ------------------ Sidebar Filters (RE-GROUPED) ------------------
+    # ------------------ Sidebar Filters (Grouped) ------------------
     st.sidebar.header("Filters")
     
-    # Get all available banks for filter options
     banks_available = sorted([b for b in converted_df_with_balance["Bank"].dropna().unique().tolist()])
     if not banks_available:
         banks_available = ["Unknown"]
     
-    # Store this list in session state for the 'Add Row' form
     st.session_state.all_bank_options = banks_available.copy()
 
     # --- Expander 1: Chart & Metric Options ---
@@ -290,19 +289,17 @@ def main():
     # --- Expander 2: Transaction Filters ---
     with st.sidebar.expander("🔍 Transaction Filters", expanded=True):
         
-        # --- FIX: Set default selection only on the first run ---
         if "selected_banks_filter" not in st.session_state:
             st.session_state.selected_banks_filter = banks_available.copy()
 
         sel_banks = st.multiselect(
             "Banks", 
             options=banks_available, 
-            key="selected_banks_filter" # This key links to the persistent selection
+            key="selected_banks_filter"
         )
         
         totals_mode = st.radio("Totals mode", ["Single date", "Date range"], index=0)
 
-        # --- Date Range (for rows & totals) ---
         valid_dates_all = converted_df_with_balance["timestamp"].dropna()
         if valid_dates_all.empty:
             st.warning("No valid dates found in data.")
@@ -314,7 +311,7 @@ def main():
             min_date, max_date = max_date, min_date
         
         today = datetime.utcnow().date()
-        default_sel_date = min(max(today, min_date), max_date) # Default to today, clamped within range
+        default_sel_date = min(max(today, min_date), max_date)
 
         if totals_mode == "Single date":
             sel_date = st.date_input("Pick date", value=default_sel_date, min_value=min_date, max_value=max_date)
@@ -326,17 +323,14 @@ def main():
             if isinstance(dr, (tuple, list)) and len(dr) == 2:
                 start_sel, end_sel = dr
             else:
-                start_sel, end_sel = dr, dr # Fallback if only one date is picked
+                start_sel, end_sel = dr, dr
             
             if start_sel > end_sel:
                 start_sel, end_sel = end_sel, start_sel
     
-
     # ------------------ Apply Filters ------------------
-    # Use the 'Balance' inclusive dataframe
     filtered_df = converted_df_with_balance[converted_df_with_balance["Bank"].isin(sel_banks)].copy()
 
-    # compute filtered daily totals for charts
     with st.spinner("Computing daily totals..."):
         try:
             merged = transform.compute_daily_totals(filtered_df.copy())
@@ -349,11 +343,10 @@ def main():
     if not merged.empty:
         merged["Date"] = pd.to_datetime(merged["Date"]).dt.normalize()
 
-
     # ------------------ Compute totals for selected date/range ------------------
     tmp = filtered_df.copy()
     mask = tmp["timestamp"].dt.date.between(start_sel, end_sel)
-    sel_df = tmp.loc[mask] # This is the final filtered DF for table + totals
+    sel_df = tmp.loc[mask] 
 
     amt_col = next((c for c in sel_df.columns if c.lower() == "amount"), None)
     type_col = next((c for c in sel_df.columns if c.lower() == "type"), None)
@@ -454,41 +447,49 @@ def main():
             unsafe_allow_html=True,
         )
 
-    # ------------------ Charts ------------------
+    # ------------------ Charts (MODIFIED) ------------------
     st.subheader("📊 Charts")
-    if not merged.empty and charts_mod is not None:
+    if charts_mod is None:
+        st.info("charts.py module is not available.")
+    elif merged.empty:
+        st.info("No data available for the selected chart filters.")
+    else:
         series_selected = []
         if show_debit:
             series_selected.append("Total_Spent")
         if show_credit:
             series_selected.append("Total_Credit")
-        try:
-            charts_mod.render_chart(merged, filtered_df, chart_type, series_selected, top_n=top_n, height=420)
-        except Exception as e:
-            st.error("Chart rendering failed. See traceback below.")
-            st.exception(e)
-            st.text(traceback.format_exc())
-    else:
-        st.info("No data for charts (or charts.py is missing).")
+        
+        # --- FIX: Added check for empty series ---
+        if not series_selected:
+            st.info("No chart series selected. Please check 'Show Debit' or 'Show Credit' in the sidebar.")
+        else:
+            try:
+                charts_mod.render_chart(merged, filtered_df, chart_type, series_selected, top_n=top_n, height=420)
+            except Exception as e:
+                st.error("Chart rendering failed. See traceback below.")
+                st.exception(e)
+                st.text(traceback.format_exc())
+    # --- END MODIFIED CHARTS ---
 
-    # ------------------ Rows Table (MODIFIED) ------------------
+
+    # ------------------ Rows Table ------------------
     st.subheader("Rows (matching selection)")
     rows_df = sel_df.copy() # Use the date-filtered dataframe
 
-    _desired = ['timestamp', 'bank', 'type', 'amount', 'balance', 'message'] # Added 'balance'
+    _desired = ['timestamp', 'bank', 'type', 'amount', 'balance', 'message']
     col_map = {c.lower(): c for c in rows_df.columns}
     display_cols = [col_map[d] for d in _desired if d in col_map]
     
     if not any(c.lower() == 'timestamp' for c in display_cols) and 'date' in col_map: 
         display_cols.insert(0, col_map['date'])
 
-    if not display_cols: # Fallback
+    if not display_cols: 
         st.warning("Could not find preferred columns - showing raw data."); 
         display_df = rows_df
     else:
         display_df = rows_df[display_cols].copy()
         
-        # Formatting
         ts_col = next((c for c in display_df.columns if c.lower() in ['timestamp', 'date']), None)
         if ts_col: display_df[ts_col] = pd.to_datetime(display_df[ts_col], errors='coerce').dt.strftime('%Y-%m-%d %H:%M').fillna('')
         
@@ -507,7 +508,6 @@ def main():
         final_order = [c for c in ['Timestamp', 'Bank', 'Type', 'Amount', 'Balance', 'Message'] if c in display_df.columns]
         display_df = display_df[final_order]
 
-    # Sort by timestamp descending for display
     if 'Timestamp' in display_df.columns:
         display_df = display_df.sort_values(by='Timestamp', ascending=False)
 
@@ -517,10 +517,9 @@ def main():
         height=420,
         column_config={
             "Amount": st.column_config.NumberColumn(format="₹%.2f"),
-            "Balance": st.column_config.NumberColumn(format="₹%.0f") # Format balance
+            "Balance": st.column_config.NumberColumn(format="₹%.0f")
         }
     )
-    # --- END MODIFIED TABLE ---
 
     csv_data = display_df.to_csv(index=False).encode("utf-8")
     st.download_button("📥 Download CSV", csv_data, "transactions.csv", "text/csv")
@@ -532,7 +531,6 @@ def main():
     if io_mod is None:
         st.info("Write operations (including remove) are disabled because io_helpers failed to import.")
     else:
-        # Use rows_df, which is already filtered by bank + date
         if "_sheet_row_idx" not in rows_df.columns or "_source_sheet" not in rows_df.columns:
             st.error("Missing internal row mapping columns ('_sheet_row_idx' or '_source_sheet'). Cannot delete rows.")
             st.info("These columns are normally added automatically when reading Google Sheets. Ensure io_helpers.read_google_sheet is used.")
@@ -603,7 +601,7 @@ def main():
                     else:
                         st.success(f"Marked {overall_updated} rows as deleted.")
                         st.session_state.reload_key += 1
-                        st.rerun() # --- FIX: Replaced st.experimental_rerun() ---
+                        st.rerun()
 
     # ------------------ Add New Row ------------------
     st.markdown("---")
@@ -622,8 +620,7 @@ def main():
         with st.expander("Add new row"):
             with st.form("add_row_form", clear_on_submit=True):
                 new_date = st.date_input("Date (picker)", value=datetime.utcnow().date())
-
-                # --- FIX: Use the 'all_bank_options' list from session state ---
+                
                 add_bank_options = st.session_state.all_bank_options.copy()
                 add_bank_options = sorted(list(set(add_bank_options)))
 
@@ -666,10 +663,9 @@ def main():
                         if res.get("status") == "ok":
                             st.success("✅ Row added successfully!")
                             st.session_state.reload_key += 1
-                            # Clear selection cache to default to all (including new bank)
                             if "selected_banks_filter" in st.session_state:
                                 del st.session_state.selected_banks_filter
-                            st.rerun() # --- FIX: Replaced st.experimental_rerun() ---
+                            st.rerun()
                         else:
                             st.error(f"Failed to add row: {res}")
                     except Exception as e:
