@@ -3,20 +3,17 @@ import streamlit as st
 import pandas as pd
 import importlib
 from datetime import datetime, date, time as dt_time, timedelta
-import traceback
+import traceback  # Keep this import
 from typing import Optional
 import math
 
 st.set_page_config(page_title="💳 Daily Spend Tracker", layout="wide")
 st.title("💳 Daily Spending")
 
-# --- NEW: Added Demo Data Warning ---
 st.warning(
     "**Demo Mode:** This application is currently displaying sample data for demonstration "
     "purposes only. The figures shown are not real."
 )
-# --- END NEW ---
-
 
 # --- Helper Function to Calculate Running Balance (from 0) ---
 def calculate_running_balance(df: pd.DataFrame) -> pd.DataFrame:
@@ -61,20 +58,21 @@ def calculate_running_balance(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def main():
-    # ------------------ Module Imports ------------------
+    # ------------------ Module Imports (SECURED) ------------------
     try:
         transform = importlib.import_module("transform")
     except Exception as e:
-        st.error("❌ Missing or broken transform.py.")
-        st.exception(e)
-        st.text(traceback.format_exc())
+        # --- MODIFIED: Removed stack trace from UI ---
+        st.error("❌ Missing or broken transform.py. App cannot start. Check logs for details.")
+        print(f"Failed to import transform.py: {e}\n{traceback.format_exc()}") # Logs for developer
         return
 
     try:
         import io_helpers as io_mod
     except Exception as e:
+        # --- MODIFIED: Removed stack trace from UI ---
         st.warning("⚠️ io_helpers import failed — write operations disabled. Continuing in read-only mode.")
-        st.exception(e)
+        print(f"Failed to import io_helpers.py: {e}\n{traceback.format_exc()}") # Logs for developer
         io_mod = None
 
     try:
@@ -104,11 +102,9 @@ def main():
         st.session_state.last_refreshed = None
     if "all_bank_options" not in st.session_state:
         st.session_state.all_bank_options = []
-    # --- FIX: Removed faulty initialization of selected_banks_filter ---
-    # We will now set the default in the sidebar logic where 'banks_available' is known
 
 
-    # ------------------ Helpers ------------------
+    # ------------------ Helpers (SECURED) ------------------
     def _get_creds_info():
         if io_mod is None:
             return None
@@ -123,8 +119,9 @@ def main():
         try:
             df = io_mod.read_google_sheet(spreadsheet_id, range_name, creds_info=creds_info)
         except Exception as e:
-            st.error(f"Failed to read sheet '{range_name}': {e}")
-            st.text(traceback.format_exc())
+            # --- MODIFIED: Removed stack trace from UI ---
+            st.error(f"Failed to read Google Sheet '{range_name}'. Check permissions and sheet name.")
+            print(f"Failed to read sheet '{range_name}': {e}\n{traceback.format_exc()}") # Logs for developer
             return pd.DataFrame()
         df = df.reset_index(drop=True)
         if not df.empty:
@@ -184,13 +181,13 @@ def main():
         st.warning("No visible rows (after filtering deleted entries).")
         return
 
-    # ------------------ Transform ------------------
+    # ------------------ Transform (SECURED) ------------------
     try:
         converted_df = transform.convert_columns_and_derives(df_raw.copy())
     except Exception as e:
-        st.error("Error while transforming sheet data (convert_columns_and_derives). See traceback below.")
-        st.exception(e)
-        st.text(traceback.format_exc())
+        # --- MODIFIED: Removed stack trace from UI ---
+        st.error("Error while transforming sheet data. Check logs for details.")
+        print(f"Error in transform.convert_columns_and_derives: {e}\n{traceback.format_exc()}") # Logs for developer
         return
 
     # restore mapping cols if transform removed them
@@ -200,7 +197,7 @@ def main():
                 converted_df["_sheet_row_idx"] = df_raw["_sheet_row_idx"].reset_index(drop=True)
                 converted_df["_source_sheet"] = df_raw["_source_sheet"].reset_index(drop=True)
     except Exception:
-        pass
+        pass # This is minor, no need to alert user
 
     if "timestamp" in converted_df.columns:
         converted_df["timestamp"] = pd.to_datetime(converted_df["timestamp"], errors="coerce")
@@ -253,12 +250,14 @@ def main():
     # --- END BALANCE SECTION ---
 
 
-    # ------------------ Compute global daily totals ------------------
+    # ------------------ Compute global daily totals (SECURED) ------------------
     try:
         merged_all = transform.compute_daily_totals(converted_df_with_balance.copy())
         if not merged_all.empty:
             merged_all["Date"] = pd.to_datetime(merged_all["Date"]).dt.normalize()
-    except Exception:
+    except Exception as e:
+        # --- MODIFIED: Silent fail, but log it ---
+        print(f"Error computing global daily totals: {e}\n{traceback.format_exc()}") # Logs for developer
         merged_all = pd.DataFrame()
 
     # ------------------ Sidebar Filters (Grouped) ------------------
@@ -337,9 +336,9 @@ def main():
         try:
             merged = transform.compute_daily_totals(filtered_df.copy())
         except Exception as e:
-            st.error("Error in compute_daily_totals(). See traceback below.")
-            st.exception(e)
-            st.text(traceback.format_exc())
+            # --- MODIFIED: Removed stack trace from UI ---
+            st.error("Error in compute_daily_totals(). Check logs for details.")
+            print(f"Error in compute_daily_totals: {e}\n{traceback.format_exc()}") # Logs for developer
             merged = pd.DataFrame()
 
     if not merged.empty:
@@ -365,7 +364,7 @@ def main():
             credit_count = int(credit_mask.sum())
             debit_count = int(debit_mask.sum())
 
-    # ------------------ Monthly average metric logic ------------------
+    # ------------------ Monthly average metric logic (SECURED) ------------------
     def _safe_mean(s):
         s2 = pd.to_numeric(s, errors="coerce").dropna()
         return float(s2.mean()) if not s2.empty else None
@@ -415,7 +414,9 @@ def main():
             metric_avg, metric_count, _ = _compute_month_avg_from_merged(merged_all, metric_year, metric_month, replace_outliers=exclude_outliers)
             prev_dt = datetime(metric_year, metric_month, 1) - pd.DateOffset(months=1)
             prev_avg, prev_count, _ = _compute_month_avg_from_merged(merged_all, int(prev_dt.year), int(prev_dt.month), replace_outliers=exclude_outliers)
-        except Exception:
+        except Exception as e:
+            # --- MODIFIED: Silent fail, but log it ---
+            print(f"Error computing monthly avg metric: {e}\n{traceback.format_exc()}") # Logs for developer
             metric_avg = prev_avg = None
 
     # ------------------ Top-right compact metric ------------------
@@ -449,12 +450,11 @@ def main():
             unsafe_allow_html=True,
         )
 
-    # ------------------ Charts ------------------
+    # ------------------ Charts (SECURED) ------------------
     st.subheader("📊 Charts")
     if charts_mod is None:
         st.info("charts.py module is not available.")
     elif merged.empty:
-        # This message now appears if the bank filter is empty
         st.info("No data available for the selected chart filters. Please select one or more banks in the sidebar.")
     else:
         series_selected = []
@@ -469,9 +469,9 @@ def main():
             try:
                 charts_mod.render_chart(merged, filtered_df, chart_type, series_selected, top_n=top_n, height=420)
             except Exception as e:
-                st.error("Chart rendering failed. See traceback below.")
-                st.exception(e)
-                st.text(traceback.format_exc())
+                # --- MODIFIED: Removed stack trace from UI ---
+                st.error("Chart rendering failed. Check logs for details.")
+                print(f"Chart rendering failed: {e}\n{traceback.format_exc()}") # Logs for developer
 
 
     # ------------------ Rows Table ------------------
@@ -525,7 +525,7 @@ def main():
     csv_data = display_df.to_csv(index=False).encode("utf-8")
     st.download_button("📥 Download CSV", csv_data, "transactions.csv", "text/csv")
 
-    # ------------------ Remove Rows UI (soft delete) ------------------
+    # ------------------ Remove Rows UI (soft delete) (SECURED) ------------------
     st.markdown("---")
     st.write("🗑️ Remove rows (soft delete)")
 
@@ -591,20 +591,23 @@ def main():
                             if res.get("status") == "ok":
                                 overall_updated += int(res.get("updated", 0))
                             else:
+                                # --- MODIFIED: Show simple error to user ---
                                 errors.append(f"{src}: {res.get('message')}")
                         except Exception as e:
-                            errors.append(f"{src}: {e}")
+                            # --- MODIFIED: Log detailed error, show simple error to user ---
+                            print(f"Error marking rows deleted for {src}: {e}\n{traceback.format_exc()}") # Logs for developer
+                            errors.append(f"{src}: An unexpected error occurred.")
 
                     if errors:
                         st.error("Some deletions failed:")
                         for e in errors:
-                            st.text(e)
+                            st.text(e) # Show simplified error message
                     else:
                         st.success(f"Marked {overall_updated} rows as deleted.")
                         st.session_state.reload_key += 1
                         st.rerun()
 
-    # ------------------ Add New Row ------------------
+    # ------------------ Add New Row (SECURED) ------------------
     st.markdown("---")
     st.write("➕ Add a new transaction")
 
@@ -649,7 +652,7 @@ def main():
                             "Bank": chosen_bank,
                             "Type": txn_type,
                             "Amount": amount,
-                            "Message": msg,
+                            "Message": msg, # Sanitization is handled by io_helpers.py
                             "is_deleted": "false",
                         }
                         
@@ -670,9 +673,9 @@ def main():
                         else:
                             st.error(f"Failed to add row: {res}")
                     except Exception as e:
-                        st.error("Error adding row; see traceback below.")
-                        st.exception(e)
-                        st.text(traceback.format_exc())
+                        # --- MODIFIED: Removed stack trace from UI ---
+                        st.error("Error adding row. Check logs for details.")
+                        print(f"Error adding row: {e}\n{traceback.format_exc()}") # Logs for developer
     else:
         st.info("Write operations disabled: io_helpers module unavailable.")
 
@@ -689,6 +692,6 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        st.error("Unexpected error in app. See traceback below.")
-        st.exception(e)
-        st.text(traceback.format_exc())
+        # --- MODIFIED: Removed stack trace from UI ---
+        st.error("An unexpected critical error occurred. Please contact support or check the logs.")
+        print(f"Unexpected error in main(): {e}\n{traceback.format_exc()}") # Logs for developer
