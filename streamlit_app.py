@@ -10,10 +10,30 @@ import math
 st.set_page_config(page_title="💳 Daily Spend Tracker", layout="wide")
 st.title("💳 Daily Spending")
 
-st.warning(
-    "**Demo Mode:** This application is currently displaying sample data for demonstration "
-    "purposes only. The figures shown are not real."
+# st.warning(
+#     "**Demo Mode:** This application is currently displaying sample data for demonstration "
+#     "purposes only. The figures shown are not real."
+# ) 
+import streamlit as st
+
+st.markdown(
+    """
+    <div style="
+        background-color:#ffe6e6;
+        padding:12px;
+        border-radius:10px;
+        border:1px solid #ff4d4d;
+    ">
+        <strong style="color:#b30000;">🚨 Demo Mode:</strong>
+        <span style="color:#660000;">
+            This application is currently displaying sample data for demonstration purposes only.
+            The figures shown are not real.
+        </span>
+    </div>
+    """,
+    unsafe_allow_html=True
 )
+
 
 # --- Helper Function to Calculate Running Balance (from 0) ---
 def calculate_running_balance(df: pd.DataFrame) -> pd.DataFrame:
