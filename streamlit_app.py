@@ -181,7 +181,7 @@ def main():
         st.info("If you don't need write access, add a dummy gcp_service_account or comment out write code while debugging.")
         return
 
-    with st.spinner("Fetching Google Sheets..."):
+    with st.spinner("Fetching Data..."):
         history_df, append_df = fetch_sheets(SHEET_ID, RANGE, APPEND_RANGE, creds_info, st.session_state.reload_key)
         st.session_state.last_refreshed = datetime.utcnow()
 
