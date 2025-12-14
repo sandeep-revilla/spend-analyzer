@@ -40,6 +40,13 @@ def calculate_running_balance(df: pd.DataFrame) -> pd.DataFrame:
     """
     Calculates a running balance in-memory, assuming a starting balance of 0
     for each bank before its first transaction.
+
+    UPDATED behavior:
+      - Only transactions that satisfy:
+           Type == 'debit' (case-insensitive) AND Subtype == 'account' (case-insensitive)
+        will update the running balance.
+      - All other transactions will not change the running balance (they contribute 0).
+      - This keeps all rows but the cumulative sum only includes the qualifying rows.
     """
     df = df.copy()
     
@@ -61,18 +68,39 @@ def calculate_running_balance(df: pd.DataFrame) -> pd.DataFrame:
     df['Type_norm'] = df.get('Type', 'debit').astype(str).str.lower()
     df['Bank'] = df.get('Bank', 'Unknown').astype(str).str.strip()
 
-    # Create a 'signed' amount for credits (+) and debits (-)
-    df['Signed_Amount'] = df.apply(
-        lambda r: r['Amount'] if r['Type_norm'] == 'credit' else -r['Amount'],
-        axis=1
-    )
-    
+    # Find subtype column case-insensitively, if exists
+    subtype_col = next((c for c in df.columns if str(c).lower() == 'subtype'), None)
+
+    # Create a 'signed' amount only for rows where Type == 'debit' AND Subtype == 'account'
+    # These rows will reduce the balance (debit -> subtract). Other rows contribute 0.
+    if subtype_col:
+        df['Subtype_norm'] = df[subtype_col].astype(str).str.lower().str.strip()
+    else:
+        df['Subtype_norm'] = ""  # empty if no subtype column
+
+    def _signed_amount(row):
+        # only update for debit + subtype account
+        if row.get('Type_norm') == 'debit' and str(row.get('Subtype_norm', '')).lower() == 'account':
+            # debit reduces balance
+            return -float(row.get('Amount') or 0.0)
+        else:
+            # do not change balance for other rows
+            return 0.0
+
+    df['Signed_Amount'] = df.apply(_signed_amount, axis=1)
+
     # Sort by bank, then time, to ensure the cumsum is in the correct order
-    df = df.sort_values(by=['Bank', 'timestamp'])
-    
+    df = df.sort_values(by=['Bank', 'timestamp', df.index.name or df.index.tolist() if False else df.index], ignore_index=True)
+
     # The running balance is the cumulative sum, grouped by bank
     df['Balance'] = df.groupby('Bank')['Signed_Amount'].cumsum()
-    
+
+    # Clean up temporary helper columns (optional)
+    try:
+        df.drop(columns=['Subtype_norm', 'Signed_Amount'], inplace=True)
+    except Exception:
+        pass
+
     return df
 # --- END HELPER FUNCTION ---
 
