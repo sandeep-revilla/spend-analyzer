@@ -90,7 +90,7 @@ def calculate_running_balance(df: pd.DataFrame) -> pd.DataFrame:
     df['Signed_Amount'] = df.apply(_signed_amount, axis=1)
 
     # Sort by bank, then time, to ensure the cumsum is in the correct order
-    df = df.sort_values(by=['Bank', 'timestamp', df.index.name or df.index.tolist() if False else df.index], ignore_index=True)
+    df = df.sort_values(by=['Bank', 'timestamp']).reset_index(drop=True)
 
     # The running balance is the cumulative sum, grouped by bank
     df['Balance'] = df.groupby('Bank')['Signed_Amount'].cumsum()
