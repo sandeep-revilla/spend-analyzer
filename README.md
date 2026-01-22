@@ -59,11 +59,13 @@ Install dependencies using:
 Loads raw reviews, cleans the text, and saves the cleaned corpus.
 Output:
 - `data/aclImdb_cleaned.pkl`
+- `python src/preprocessing.py`
 
 ---
 
 ### 2. N-gram Language Modeling
 Generates unigrams, bigrams, trigrams, and computes sentence probabilities.
+`python src/ngrams.py`
 
 ---
 
