@@ -16,6 +16,9 @@ This project implements an end-to-end Natural Language Processing (NLP) pipeline
 ---
 
 ## Project Structure
+## Project Structure
+
+```text
 nlp_assignment/
 ├── data/
 │   ├── aclImdb/                  # Original IMDB dataset
@@ -35,6 +38,7 @@ nlp_assignment/
 │
 ├── README.md
 └── Test_Case_Explanation.pdf
+
 
 
 ## Requirements
