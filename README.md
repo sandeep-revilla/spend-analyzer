@@ -71,18 +71,20 @@ Generates unigrams, bigrams, trigrams, and computes sentence probabilities.
 
 ### 3. POS Tagging and Syntactic Analysis
 Applies POS tagging and extracts syntactic patterns.
+- `python src/pos_analysis.py`
 
 ---
 
 ### 4. Topic Modeling (LDA)
 Discovers hidden topics using Latent Dirichlet Allocation.
-
+- `python src/topic_modeling.py`
 ---
 
 ## Running Tests
 Basic sanity tests are written for each module.
 
 Run all tests using:
+-`python -m pytest tests/`
 
 ---
 
