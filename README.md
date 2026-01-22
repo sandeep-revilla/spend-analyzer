@@ -14,8 +14,6 @@ This project implements an end-to-end Natural Language Processing (NLP) pipeline
 - Each review is stored as a plain text file
 
 ---
-
-## Project Structure
 ## Project Structure
 
 ```text
