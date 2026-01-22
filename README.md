@@ -17,27 +17,25 @@ This project implements an end-to-end Natural Language Processing (NLP) pipeline
 
 ## Project Structure
 nlp_assignment/
-│
 ├── data/
-│ ├── aclImdb/ # Original dataset
-│ └── aclImdb_cleaned.pkl # Preprocessed dataset
+│   ├── aclImdb/                  # Original IMDB dataset
+│   └── aclImdb_cleaned.pkl       # Preprocessed dataset
 │
 ├── src/
-│ ├── preprocessing.py # Text preprocessing
-│ ├── ngrams.py # N-gram analysis
-│ ├── pos_analysis.py # POS tagging and patterns
-│ └── topic_modeling.py # LDA topic modeling
+│   ├── preprocessing.py          # Text preprocessing
+│   ├── ngrams.py                 # N-gram analysis
+│   ├── pos_analysis.py           # POS tagging and patterns
+│   └── topic_modeling.py         # LDA topic modeling
 │
 ├── tests/
-│ ├── test_preprocessing.py
-│ ├── test_ngrams.py
-│ ├── test_pos.py
-│ └── test_topic_modeling.py
+│   ├── test_preprocessing.py
+│   ├── test_ngrams.py
+│   ├── test_pos.py
+│   └── test_topic_modeling.py
 │
 ├── README.md
 └── Test_Case_Explanation.pdf
 
----
 
 ## Requirements
 - Python 3.10+ (tested with Python 3.14)
