@@ -65,7 +65,7 @@ Output:
 
 ### 2. N-gram Language Modeling
 Generates unigrams, bigrams, trigrams, and computes sentence probabilities.
-`python src/ngrams.py`
+- `python src/ngrams.py`
 
 ---
 
