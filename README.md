@@ -49,7 +49,7 @@ nlp_assignment/
   - pytest
 
 Install dependencies using:
- pip install nltk scikit-learn numpy pytest
+ **pip install nltk scikit-learn numpy pytest**
 
 ---
 
